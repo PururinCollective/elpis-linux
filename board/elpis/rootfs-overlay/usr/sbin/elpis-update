@@ -21,6 +21,7 @@
 # needed to go ahead.
 
 PROG=elpis-update
+# shellcheck source=../libexec/elpis/lib.sh
 . /usr/libexec/elpis/lib.sh
 
 PUBKEY=/etc/elpis/update.pub
@@ -77,7 +78,7 @@ cleanup() {
 }
 
 do_from_iso() {
-	local src= sig= unsigned=0 iso rel ver build arch slot need avail
+	local src='' sig='' unsigned=0 iso rel ver build arch slot need avail
 	while [ $# -gt 0 ]; do
 		case $1 in
 		--sig) sig=$2; shift ;;
@@ -118,8 +119,9 @@ do_from_iso() {
 
 	mount -o loop,ro -t iso9660 "$iso" "$MNT" || die "$src is not an ISO image"
 	rel=$MNT/boot/elpis-release
-	[ -f "$rel" ] && [ -f "$MNT/boot/bzImage" ] && [ -f "$MNT/boot/rootfs.cpio.xz" ] ||
+	if [ ! -f "$rel" ] || [ ! -f "$MNT/boot/bzImage" ] || [ ! -f "$MNT/boot/rootfs.cpio.xz" ]; then
 		die "$src is not an Elpis ISO"
+	fi
 	ver=$(sed -n 's/^VERSION=//p' "$rel")
 	build=$(sed -n 's/^BUILD_ID=//p' "$rel")
 	arch=$(sed -n 's/^ARCH=//p' "$rel")
@@ -137,12 +139,13 @@ do_from_iso() {
 	rm -rf "$SYSTEM_DIR/$slot.new"
 	mkdir -p "$SYSTEM_DIR/$slot.new"
 	for f in bzImage rootfs.cpio.xz elpis-release; do
-		cp "$MNT/boot/$f" "$SYSTEM_DIR/$slot.new/$f" &&
-			cmp -s "$MNT/boot/$f" "$SYSTEM_DIR/$slot.new/$f" ||
+		if ! cp "$MNT/boot/$f" "$SYSTEM_DIR/$slot.new/$f" ||
+		   ! cmp -s "$MNT/boot/$f" "$SYSTEM_DIR/$slot.new/$f"; then
 			die "could not copy $f to ELPIS-DATA"
+		fi
 	done
 	sync
-	rm -rf "$SYSTEM_DIR/$slot"
+	rm -rf "${SYSTEM_DIR:?}/$slot"
 	mv "$SYSTEM_DIR/$slot.new" "$SYSTEM_DIR/$slot" || die "could not install $slot"
 	grubenv_set base="$MEDIA_UUID" next="$slot" tries=3 || die "could not write $GRUBENV"
 	cleanup

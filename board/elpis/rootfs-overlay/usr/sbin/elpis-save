@@ -13,6 +13,7 @@
 # Exit status: 0 saved, 1 failed, 3 settings are in RAM only (no ELPIS-DATA).
 
 PROG=elpis-save
+# shellcheck source=../libexec/elpis/lib.sh
 . /usr/libexec/elpis/lib.sh
 
 if [ "$1" = -h ] || [ "$1" = --help ]; then
@@ -36,6 +37,7 @@ fi
 mkdir -p "$CONFIG_STORE" || die "cannot write to $CONFIG_STORE"
 
 if [ $# = 0 ]; then
+	# shellcheck disable=SC2046  # one path per word
 	set -- $(keep_paths)
 else
 	for p in "$@"; do

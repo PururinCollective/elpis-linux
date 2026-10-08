@@ -20,8 +20,9 @@ null::sysinit:/bin/ln -sf /proc/self/fd/2 /dev/stderr
 # Confirms a freshly installed update once the resolver answers
 ::once:/usr/libexec/elpis/health
 
-# Logins on the screen and, when there is one, the first serial port
-tty1::respawn:/sbin/getty -L tty1 0 linux
+# The screen runs the setup guide and menu; the first serial port, when
+# there is one, has a login
+tty1::respawn:/usr/sbin/elpis-config --console
 ttyS0::respawn:/usr/libexec/elpis/serial-getty ttyS0
 
 ::ctrlaltdel:/sbin/reboot

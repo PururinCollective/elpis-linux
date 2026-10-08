@@ -16,6 +16,7 @@
 # from the copy if you can.
 
 PROG=elpis-copy-to-disk
+# shellcheck source=../libexec/elpis/lib.sh
 . /usr/libexec/elpis/lib.sh
 
 usage() {
@@ -24,8 +25,8 @@ usage() {
 }
 
 disk_info() {
-	local d=$1 model serial
-	model=$(cat "/sys/block/$d/device/model" 2>/dev/null | tr -s ' ' | sed 's/ *$//')
+	local d="$1" model serial
+	model=$({ tr -s ' ' < "/sys/block/$d/device/model"; } 2>/dev/null | sed 's/ *$//')
 	serial=$(cat "/sys/block/$d/device/serial" "/sys/block/$d/serial" 2>/dev/null | head -n 1 | tr -d ' ')
 	printf '%s MiB  %s  %s' "$(( $(disk_sectors "$d") / 2048 ))" "${model:-?}" "${serial:--}"
 }
@@ -51,9 +52,10 @@ do_list() {
 # Size of the ISO image on the boot medium: it ends where its appended EFI
 # partition (MBR entry 2) ends.
 image_bytes() {
-	local d=$1 type start size
+	local d="$1" type start size
 	type=$(dd if="/dev/$d" bs=512 count=1 2>/dev/null | od -An -tx1 -j 466 -N 1 | tr -d ' ')
 	[ "$type" = ef ] || return 1
+	# shellcheck disable=SC2046  # two numbers
 	set -- $(dd if="/dev/$d" bs=512 count=1 2>/dev/null | od -An -tu4 -j 470 -N 8)
 	start=$1 size=$2
 	[ -n "$size" ] && [ "$size" -gt 0 ] || return 1
@@ -61,7 +63,7 @@ image_bytes() {
 }
 
 do_copy() {
-	local t= keep=0 yes=0 bytes blocks answer slot tdata tmnt p
+	local t='' keep=0 yes=0 bytes blocks answer slot tdata tmnt p
 	while [ $# -gt 0 ]; do
 		case $1 in
 		--disk) t=${2#/dev/}; shift ;;

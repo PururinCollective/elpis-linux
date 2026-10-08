@@ -13,6 +13,7 @@
 #   elpis-storage request-reset   erase settings and updates at the next start
 
 PROG=elpis-storage
+# shellcheck source=../libexec/elpis/lib.sh
 . /usr/libexec/elpis/lib.sh
 
 usage() {
@@ -32,7 +33,7 @@ media_disks() {
 # More than one: the one with the ELPIS-DATA GRUB used, else a disk over a
 # CD, else the first.
 pick_media_disk() {
-	local hint=$1 d dd
+	local hint="$1" d dd
 	shift
 	if [ -n "$hint" ]; then
 		dd=$(blkid -c /dev/null -t UUID="$hint" -o device 2>/dev/null | head -n 1)
@@ -113,7 +114,7 @@ do_boot() {
 	SAFE=0; cmdline elpis.safe >/dev/null && SAFE=1
 	RESET=0; cmdline elpis.reset >/dev/null && RESET=1
 	HINT=$(cmdline elpis.data)
-	MODE=ram REASON= DATA_DEV= MEDIA_DISK= MEDIA_WRITABLE=no CREATED=0
+	MODE=ram REASON='' DATA_DEV='' MEDIA_DISK='' MEDIA_WRITABLE=no CREATED=0
 	local disks i=0 rc cands n
 
 	if [ -z "$MEDIA_UUID" ]; then
@@ -182,7 +183,7 @@ do_boot() {
 		if [ -z "$DATA_DEV" ] && [ "$n" = 1 ]; then
 			DATA_DEV=$cands
 		elif [ -z "$DATA_DEV" ] && [ "$n" -gt 1 ]; then
-			REASON="more than one ELPIS-DATA partition ($(echo $cands)); none was used"
+			REASON="more than one ELPIS-DATA partition ($(echo "$cands" | tr '\n' ' ')); none was used"
 		elif [ -z "$DATA_DEV" ] && [ -z "$REASON" ]; then
 			case $MEDIA_DISK in
 			sr*) REASON="started from a CD, and no disk holds ELPIS-DATA" ;;
@@ -254,16 +255,16 @@ do_status() {
 }
 
 confirm_disk() {
-	local d=$1 answer
+	local d="$1" answer
 	echo "This erases everything on /dev/$d:"
-	echo "  $(cat "/sys/block/$d/device/model" 2>/dev/null | tr -s ' ') $(( $(disk_sectors "$d") / 2048 )) MiB"
+	echo "  $({ tr -s ' ' < "/sys/block/$d/device/model"; } 2>/dev/null) $(( $(disk_sectors "$d") / 2048 )) MiB"
 	printf 'Type the disk name (%s) to go ahead: ' "$d"
 	read -r answer
 	[ "$answer" = "$d" ] || die "not confirmed; nothing was changed"
 }
 
 do_init_disk() {
-	local d=${1#/dev/} rc
+	local d="${1#/dev/}" rc
 	[ -n "$d" ] || usage
 	state_load
 	disk_writable "$d" || die "/dev/$d cannot be written"
@@ -277,16 +278,17 @@ do_init_disk() {
 }
 
 do_format_blank() {
-	local d=${1#/dev/} yes=$2 p
+	local d="${1#/dev/}" yes="$2" p
 	[ -n "$d" ] || usage
 	state_load
 	[ "$d" != "$MEDIA_DISK" ] || die "/dev/$d is the boot medium"
 	disk_writable "$d" || die "/dev/$d cannot be written"
 	[ -z "$(disk_mounted_parts "$d")" ] || die "/dev/$d has mounted partitions"
-	[ -z "$(blkid -c /dev/null -p -o value -s PTTYPE "/dev/$d" 2>/dev/null)" ] &&
-		[ -z "$(blkid -c /dev/null -p -o value -s TYPE "/dev/$d" 2>/dev/null)" ] &&
-		cmp -s -n 1048576 "/dev/$d" /dev/zero ||
+	if [ -n "$(blkid -c /dev/null -p -o value -s PTTYPE "/dev/$d" 2>/dev/null)" ] ||
+	   [ -n "$(blkid -c /dev/null -p -o value -s TYPE "/dev/$d" 2>/dev/null)" ] ||
+	   ! cmp -s -n 1048576 "/dev/$d" /dev/zero; then
 		die "/dev/$d is not blank; only an empty disk is formatted here"
+	fi
 	[ "$yes" = --yes ] || confirm_disk "$d"
 
 	echo 'start=2048, type=83' | sfdisk -q --wipe never "/dev/$d" || die "could not partition /dev/$d"

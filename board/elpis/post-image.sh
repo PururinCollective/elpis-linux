@@ -24,7 +24,8 @@ ISO=$BINARIES_DIR/elpis-$VERSION-$ARCH.iso
 
 die() { echo "post-image: $*" >&2; exit 1; }
 
-GRUB_BUILD=$(ls -d "$BUILD_DIR"/grub2-*/ 2>/dev/null | head -n 1)
+GRUB_BUILD=
+for d in "$BUILD_DIR"/grub2-*/; do [ -d "$d" ] && GRUB_BUILD=$d && break; done
 [ -n "$GRUB_BUILD" ] || die "grub2 build directory not found"
 GRUB_PC=${GRUB_BUILD}build-i386-pc/grub-core
 GRUB_EFI=${GRUB_BUILD}build-x86_64-efi/grub-core
@@ -54,9 +55,11 @@ fill "$BOARD/grub/embed.cfg" > "$WORK/embed.cfg"
 MODS="iso9660 part_msdos ext2 fat search search_fs_uuid search_label
       configfile normal linux test loadenv regexp probe echo true sleep cat ls
       halt reboot serial terminal"
+# shellcheck disable=SC2086  # MODS is a list
 "$HOST_DIR/bin/grub-mkimage" -d "$GRUB_PC" -O i386-pc-eltorito \
     -o "$ROOT/boot/grub/bios.img" -p /boot/grub -c "$WORK/embed.cfg" \
     biosdisk $MODS
+# shellcheck disable=SC2086
 "$HOST_DIR/bin/grub-mkimage" -d "$GRUB_EFI" -O x86_64-efi \
     -o "$WORK/BOOTX64.EFI" -p /boot/grub -c "$WORK/embed.cfg" \
     efi_gop efi_uga $MODS

@@ -7,6 +7,7 @@
 # image's defaults are used instead, and the log says why.
 
 PROG=elpis
+# shellcheck source=lib.sh
 . /usr/libexec/elpis/lib.sh
 
 CONF=/etc/elpis/elpis.conf
