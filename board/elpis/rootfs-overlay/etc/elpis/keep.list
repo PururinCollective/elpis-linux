@@ -1,0 +1,10 @@
+# What elpis-save keeps on ELPIS-DATA, and what is put back at every start.
+# One absolute path per line, no spaces; a directory is kept whole.
+# "elpis-save PATH" adds to this list in keep.list.local on ELPIS-DATA.
+/etc/elpis/elpis.conf
+/etc/elpis/elpis.conf.shipped
+/etc/elpis/ntp.conf
+/etc/network/interfaces
+/etc/hostname
+/etc/shadow
+/etc/dropbear

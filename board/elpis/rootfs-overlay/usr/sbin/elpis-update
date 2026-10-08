@@ -1,0 +1,206 @@
+#!/bin/sh
+#
+# elpis-update -- install a newer Elpis from its ISO, keeping this medium as
+# the fallback.
+#
+#   elpis-update --status
+#   elpis-update --from-iso FILE|URL [--sig FILE|URL] [--allow-unsigned]
+#   elpis-update --mark-good      (run at every start, once the resolver answers)
+#   elpis-update --revert         start the version built in to the medium again
+#   elpis-update --prune          delete updates nothing will start
+#
+# The update's kernel and root filesystem are copied to ELPIS-DATA, and GRUB
+# is told to try it (see /usr/libexec/elpis/lib.sh).  GRUB counts the tries;
+# when the resolver answers after a start, --mark-good keeps the update.
+# If it has not answered after three starts, GRUB goes back to the version
+# that worked.  The medium itself is never written.
+#
+# With /etc/elpis/update.pub in the image, an update must carry a minisign
+# signature by that key: FILE.minisig, or URL.minisig, unless --sig says
+# where.  Without a key nothing can be checked, and --allow-unsigned is
+# needed to go ahead.
+
+PROG=elpis-update
+. /usr/libexec/elpis/lib.sh
+
+PUBKEY=/etc/elpis/update.pub
+WORKDIR=$DATA/tmp
+MNT=$ELPIS_RUN/update-iso
+
+usage() {
+	sed -n '3,22s/^# \{0,1\}//p' "$0"
+	exit 2
+}
+
+running_slot() {
+	cmdline elpis.slot || echo builtin
+}
+
+need_data() {
+	persistent || die "updates are kept on ELPIS-DATA, and settings are in RAM only (${REASON:-no ELPIS-DATA})"
+	[ "$GRUBENV_WRITABLE" != no ] ||
+		warn "GRUB could not write to ELPIS-DATA at the last start; an update will not be started until it can"
+}
+
+do_status() {
+	state_load
+	echo "running:  Elpis Linux $(release VERSION) build $(release BUILD_ID) ($(running_slot))"
+	if ! persistent; then
+		echo "updates:  none possible, settings are in RAM only"
+		return 0
+	fi
+	local base next tries good s
+	base=$(grubenv_get base); next=$(grubenv_get next); tries=$(grubenv_get tries); good=$(grubenv_get good)
+	if [ -n "$base" ] && [ "$base" != "$MEDIA_UUID" ]; then
+		echo "updates:  installed over another ISO ($base); this medium ignores them"
+	fi
+	echo "next:     ${next:-none}${next:+ ($tries tries left)}"
+	echo "good:     ${good:-none (the built-in version)}"
+	for s in "$SYSTEM_DIR"/*/; do
+		[ -f "$s/elpis-release" ] || continue
+		s=$(basename "$s")
+		printf '  %s%s\n' "$s" "$([ -e "$SYSTEM_DIR/$s/FAILED" ] && echo ' (failed)')"
+	done
+}
+
+fetch() {
+	# fetch SRC DEST -- copy a file or download a URL
+	case $1 in
+	http://* | https://*) wget -q -O "$2" "$1" ;;
+	*) [ -f "$1" ] && cp "$1" "$2" ;;
+	esac
+}
+
+cleanup() {
+	grep -q " $MNT " /proc/mounts && umount "$MNT"
+	rm -rf "$WORKDIR"
+}
+
+do_from_iso() {
+	local src= sig= unsigned=0 iso rel ver build arch slot need avail
+	while [ $# -gt 0 ]; do
+		case $1 in
+		--sig) sig=$2; shift ;;
+		--allow-unsigned) unsigned=1 ;;
+		-*) usage ;;
+		*) src=$1 ;;
+		esac
+		shift
+	done
+	[ -n "$src" ] || usage
+	need_data
+
+	rm -rf "$WORKDIR"
+	mkdir -p "$WORKDIR" "$MNT"
+	trap cleanup EXIT INT TERM
+	iso=$WORKDIR/update.iso
+
+	say "fetching $src"
+	fetch "$src" "$iso" || die "could not get $src"
+	[ -n "$sig" ] || sig=$src.minisig
+	fetch "$sig" "$iso.minisig" 2>/dev/null || rm -f "$iso.minisig"
+
+	if [ -f "$PUBKEY" ]; then
+		if [ -f "$iso.minisig" ]; then
+			minisign -Vm "$iso" -x "$iso.minisig" -p "$PUBKEY" -q ||
+				die "the signature does not match: not installed"
+			say "signature checked against $PUBKEY"
+		elif [ $unsigned = 1 ]; then
+			warn "no signature ($sig), installing anyway as asked (--allow-unsigned)"
+		else
+			die "no signature at $sig; refusing an update this image cannot check"
+		fi
+	elif [ $unsigned = 1 ]; then
+		warn "this image has no update key ($PUBKEY); installing unchecked as asked"
+	else
+		die "this image has no update key ($PUBKEY), so the update cannot be checked; add --allow-unsigned to install it anyway"
+	fi
+
+	mount -o loop,ro -t iso9660 "$iso" "$MNT" || die "$src is not an ISO image"
+	rel=$MNT/boot/elpis-release
+	[ -f "$rel" ] && [ -f "$MNT/boot/bzImage" ] && [ -f "$MNT/boot/rootfs.cpio.xz" ] ||
+		die "$src is not an Elpis ISO"
+	ver=$(sed -n 's/^VERSION=//p' "$rel")
+	build=$(sed -n 's/^BUILD_ID=//p' "$rel")
+	arch=$(sed -n 's/^ARCH=//p' "$rel")
+	[ "$arch" = "$(release ARCH)" ] || die "$src is for $arch, this is $(release ARCH)"
+	case $ver$build in *[!A-Za-z0-9._-]*) die "unexpected version '$ver' build '$build'" ;; esac
+	slot=$ver-$build
+	if [ "$build" = "$(release BUILD_ID)" ]; then
+		die "$slot is the version already running"
+	fi
+
+	need=$(( ( $(stat -c %s "$MNT/boot/bzImage") + $(stat -c %s "$MNT/boot/rootfs.cpio.xz") ) / 1024 + 1024 ))
+	avail=$(df -k "$DATA" | awk 'NR == 2 { print $4 }')
+	[ "$avail" -gt "$need" ] || die "not enough room on ELPIS-DATA (need $need KiB, $avail free)"
+
+	rm -rf "$SYSTEM_DIR/$slot.new"
+	mkdir -p "$SYSTEM_DIR/$slot.new"
+	for f in bzImage rootfs.cpio.xz elpis-release; do
+		cp "$MNT/boot/$f" "$SYSTEM_DIR/$slot.new/$f" &&
+			cmp -s "$MNT/boot/$f" "$SYSTEM_DIR/$slot.new/$f" ||
+			die "could not copy $f to ELPIS-DATA"
+	done
+	sync
+	rm -rf "$SYSTEM_DIR/$slot"
+	mv "$SYSTEM_DIR/$slot.new" "$SYSTEM_DIR/$slot" || die "could not install $slot"
+	grubenv_set base="$MEDIA_UUID" next="$slot" tries=3 || die "could not write $GRUBENV"
+	cleanup
+	trap - EXIT INT TERM
+	prune
+
+	local fallback
+	fallback=$(grubenv_get good)
+	say "Elpis $ver (build $build) is installed and starts at the next reboot."
+	say "If the resolver does not answer after three starts, GRUB goes back to ${fallback:-the version built in to the medium}."
+}
+
+# Delete update directories that GRUB will not start and that are not running.
+prune() {
+	local keep_next keep_good running s
+	keep_next=$(grubenv_get next); keep_good=$(grubenv_get good); running=$(running_slot)
+	for s in "$SYSTEM_DIR"/*; do
+		[ -d "$s" ] || continue
+		s=$(basename "$s")
+		case $s in "$keep_next" | "$keep_good" | "$running") continue ;; esac
+		rm -rf "${SYSTEM_DIR:?}/$s"
+		say "removed $s"
+	done
+}
+
+do_mark_good() {
+	persistent || return 0
+	local running next tries base
+	running=$(running_slot)
+	next=$(grubenv_get next); tries=$(grubenv_get tries); base=$(grubenv_get base)
+	[ -n "$next" ] || return 0
+	if [ "$base" != "$MEDIA_UUID" ]; then
+		say "updates on ELPIS-DATA were installed over another ISO ($base); this one ignores them"
+		return 0
+	fi
+	if [ "$running" = "$next" ]; then
+		grubenv_set good="$next" next= tries= || die "could not write $GRUBENV"
+		say "$next answers: it now starts by default"
+		prune
+	elif [ "$tries" = 0 ]; then
+		: > "$SYSTEM_DIR/$next/FAILED" 2>/dev/null
+		grubenv_set next= tries=
+		warn "update $next did not answer in three starts; running $running instead"
+	fi
+}
+
+do_revert() {
+	need_data
+	grubenv_set next= tries= good= || die "could not write $GRUBENV"
+	say "the version built in to the medium starts at the next reboot"
+}
+
+state_load
+case $1 in
+--status | status | "") do_status ;;
+--from-iso) shift; do_from_iso "$@" ;;
+--mark-good) do_mark_good ;;
+--revert) do_revert ;;
+--prune) need_data; prune ;;
+*) usage ;;
+esac

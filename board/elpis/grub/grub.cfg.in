@@ -1,0 +1,114 @@
+# Elpis boot menu.
+#
+# This file is on the read-only ISO and is never rewritten.  What changes --
+# which update to start and how many tries it has left -- is in grubenv on the
+# ELPIS-DATA partition, written by elpis-update:
+#
+#   base   the ISO the updates were applied over; others ignore them
+#   next   an update not yet known to work, started while tries lasts
+#   tries  3, 2, 1, then 0: counted down here before each start of next
+#   good   the update to start once next is done with
+#
+# post-image.sh fills in the @...@ values.
+
+set timeout=3
+set default=0
+serial --unit=0 --speed=115200
+terminal_input console serial
+terminal_output console serial
+
+set iso="$root"
+set iso_uuid=@ISO_UUID@
+set args="elpis.media=@ISO_UUID@ console=ttyS0,115200 console=tty0 panic=10 quiet"
+
+# The settings partition: the one on this ISO's own disk if there is one,
+# otherwise any disk's.
+set data=
+regexp --set=1:isodisk '^([^,]+)' "$iso"
+if probe --set=lbl --label "(${isodisk},msdos3)"; then
+	if [ "$lbl" = "ELPIS-DATA" ]; then
+		set data="${isodisk},msdos3"
+	fi
+fi
+if [ -z "$data" ]; then
+	search --no-floppy --label --set=data ELPIS-DATA
+fi
+
+set slot=builtin
+if [ -n "$data" ]; then
+	if probe --set=data_uuid --fs-uuid "($data)"; then
+		set args="$args elpis.data=$data_uuid"
+	fi
+	set next=
+	set tries=
+	set good=
+	set base=
+	load_env --file "($data)/grubenv" --skip-sig next tries good base
+	if [ "$base" = "$iso_uuid" ]; then
+		if [ -n "$next" ]; then
+			if [ "$tries" = 3 ]; then
+				set tries=2
+			elif [ "$tries" = 2 ]; then
+				set tries=1
+			elif [ "$tries" = 1 ]; then
+				set tries=0
+			else
+				set tries=
+			fi
+			if [ -n "$tries" ]; then
+				# Only start an update whose try was counted, or a broken
+				# one could be started for ever.
+				if save_env --file "($data)/grubenv" tries; then
+					set slot="$next"
+				else
+					set args="$args elpis.grubenv=readonly"
+				fi
+			fi
+		fi
+		if [ "$slot" = builtin ]; then
+			if [ -n "$good" ]; then
+				set slot="$good"
+			fi
+		fi
+		if [ "$slot" != builtin ]; then
+			if [ ! -f "($data)/system/$slot/bzImage" ]; then
+				set slot=builtin
+			elif [ ! -f "($data)/system/$slot/rootfs.cpio.xz" ]; then
+				set slot=builtin
+			fi
+		fi
+	fi
+fi
+
+if [ "$slot" = builtin ]; then
+	set kernel="($iso)/boot/bzImage"
+	set initrd="($iso)/boot/rootfs.cpio.xz"
+	set title="@VERSION@"
+else
+	set kernel="($data)/system/$slot/bzImage"
+	set initrd="($data)/system/$slot/rootfs.cpio.xz"
+	set title="$slot"
+fi
+export iso data slot kernel initrd args
+
+menuentry "Elpis $title" {
+	linux $kernel $args elpis.slot=$slot
+	initrd $initrd
+}
+
+menuentry "Elpis @VERSION@ (built in to this medium)" {
+	linux ($iso)/boot/bzImage $args elpis.slot=builtin
+	initrd ($iso)/boot/rootfs.cpio.xz
+}
+
+menuentry "Safe mode: start without restoring settings" {
+	linux $kernel $args elpis.slot=$slot elpis.safe=1
+	initrd $initrd
+}
+
+submenu "Factory reset ..." {
+	menuentry "Erase all settings and updates, then start Elpis @VERSION@" {
+		linux ($iso)/boot/bzImage $args elpis.slot=builtin elpis.reset=1
+		initrd ($iso)/boot/rootfs.cpio.xz
+	}
+}

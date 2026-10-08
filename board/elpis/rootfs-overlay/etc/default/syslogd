@@ -1,0 +1,2 @@
+# The log is a 256 KiB ring buffer in RAM: read it with logread (-f to follow).
+SYSLOGD_ARGS="-C256"

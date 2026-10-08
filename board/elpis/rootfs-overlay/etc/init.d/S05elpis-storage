@@ -1,0 +1,19 @@
+#!/bin/sh
+#
+# Finds or makes ELPIS-DATA, mounts it at /data and puts saved settings back,
+# before the network and the resolver start.  See elpis-storage.
+
+case "$1" in
+start)
+	/usr/sbin/elpis-storage boot
+	;;
+stop)
+	/usr/sbin/elpis-storage stop
+	;;
+restart | reload)
+	;;
+*)
+	echo "Usage: $0 {start|stop}"
+	exit 1
+	;;
+esac

@@ -1,0 +1,8 @@
+#!/bin/sh
+# A login prompt on the serial port, when the machine has one.  Without the
+# UART, getty would fail and be restarted by init many times a second.
+port=$1
+if stty -F "/dev/$port" >/dev/null 2>&1; then
+	exec /sbin/getty -L "$port" 115200 vt100
+fi
+exec sleep 2147483647

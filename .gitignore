@@ -1,0 +1,11 @@
+# Build products and caches
+/output/
+/dl/
+/.buildroot/
+/tests/work/
+
+# Secret signing keys never belong in the repository
+*.key
+
+# Python bytecode from the test harness
+__pycache__/

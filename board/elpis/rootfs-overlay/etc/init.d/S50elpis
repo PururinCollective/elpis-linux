@@ -1,0 +1,30 @@
+#!/bin/sh
+#
+# The resolver itself runs from /etc/inittab, so that init restarts it if it
+# ever exits.  This script only starts, stops and restarts that.
+
+FLAG=/run/elpis/disabled
+
+case "$1" in
+start)
+	mkdir -p /run/elpis
+	rm -f "$FLAG"
+	;;
+stop)
+	mkdir -p /run/elpis
+	: > "$FLAG"
+	pkill -x elpis
+	;;
+restart | reload)
+	rm -f "$FLAG"
+	pkill -x elpis
+	echo "elpis restarts in a few seconds (its cache starts empty)"
+	;;
+status)
+	if pid=$(pidof elpis); then echo "elpis is running (pid $pid)"; else echo "elpis is not running"; exit 1; fi
+	;;
+*)
+	echo "Usage: $0 {start|stop|restart|status}"
+	exit 1
+	;;
+esac
