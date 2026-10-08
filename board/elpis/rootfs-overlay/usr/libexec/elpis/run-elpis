@@ -1,0 +1,30 @@
+#!/bin/sh
+#
+# Runs the resolver.  init starts this after the boot scripts and starts it
+# again whenever it exits (see /etc/inittab).
+#
+# A config that does not check out is not left to fail on every restart: the
+# image's defaults are used instead, and the log says why.
+
+PROG=elpis
+. /usr/libexec/elpis/lib.sh
+
+CONF=/etc/elpis/elpis.conf
+mkdir -p "$ELPIS_RUN"
+
+if [ -e "$ELPIS_RUN/disabled" ]; then
+	# Stopped by hand (/etc/init.d/S50elpis stop): check back later.
+	sleep 5
+	exit 0
+fi
+
+if ! out=$(/usr/sbin/elpis -t -c "$CONF" 2>&1); then
+	warn "$CONF does not check out; running with the image's defaults instead"
+	echo "$out" | logger -t elpis -p daemon.err
+	CONF=/usr/share/elpis/elpis.conf
+fi
+echo "$CONF" > "$ELPIS_RUN/config-in-use"
+
+{ /usr/sbin/elpis -c "$CONF" 2>&1; echo $? > "$ELPIS_RUN/exit-status"; } | logger -t elpis -p daemon.info
+logger -t elpis -p daemon.warning "exited with status $(cat "$ELPIS_RUN/exit-status" 2>/dev/null); restarting in 3 s"
+sleep 3

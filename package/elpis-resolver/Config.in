@@ -1,0 +1,22 @@
+config BR2_PACKAGE_ELPIS_RESOLVER
+	bool "elpis-resolver"
+	depends on BR2_TOOLCHAIN_HAS_THREADS
+	help
+	  Elpis: a private, validating, recursive DNS resolver in C99.
+
+	  https://github.com/PururinCollective/elpis-resolver
+
+if BR2_PACKAGE_ELPIS_RESOLVER
+
+config BR2_PACKAGE_ELPIS_RESOLVER_LICENCE_ISSUER
+	string "licence issuer key"
+	help
+	  Ed25519 public key, in hex, that deployment licences are
+	  checked against: the resolver's LICENCE_ISSUER build
+	  variable. Leave empty to build exactly as the published tree
+	  does, without an issuer key.
+
+endif
+
+comment "elpis-resolver needs a toolchain w/ threads"
+	depends on !BR2_TOOLCHAIN_HAS_THREADS

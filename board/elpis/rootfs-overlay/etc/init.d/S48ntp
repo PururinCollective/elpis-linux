@@ -1,0 +1,40 @@
+#!/bin/sh
+#
+# Sets the clock before the resolver starts, then keeps it in step.  DNSSEC
+# signatures are valid only between two dates, so a wrong clock fails every
+# lookup.  Servers are given by address in /etc/elpis/ntp.conf, because
+# nothing can be looked up by name before the resolver is running.
+
+CONF=/etc/elpis/ntp.conf
+PIDFILE=/run/ntpd.pid
+
+servers() {
+	sed -e 's/#.*//' "$CONF" 2>/dev/null | awk '$1 == "server" { printf " -p %s", $2 }'
+}
+
+start() {
+	args=$(servers)
+	if [ -z "$args" ]; then
+		echo "ntp: no servers in $CONF; the clock is not set"
+		return 0
+	fi
+	printf 'Setting the clock: '
+	# shellcheck disable=SC2086
+	if timeout 15 /usr/sbin/ntpd -n -q $args >/dev/null 2>&1; then
+		echo "OK, $(date -u '+%Y-%m-%d %H:%M:%S') UTC"
+		hwclock -u -w 2>/dev/null
+		[ -d /data ] && grep -q ' /data ' /proc/mounts && date -u +%s > /data/clock
+	else
+		echo "FAIL: no NTP server answered"
+		logger -t ntp -p daemon.warning "no NTP server answered; DNSSEC fails if the clock is wrong"
+	fi
+	# shellcheck disable=SC2086
+	start-stop-daemon -S -q -b -m -p "$PIDFILE" -x /usr/sbin/ntpd -- -n $args
+}
+
+case "$1" in
+start) start ;;
+stop) start-stop-daemon -K -q -p "$PIDFILE" ;;
+restart | reload) "$0" stop; start ;;
+*) echo "Usage: $0 {start|stop|restart}"; exit 1 ;;
+esac

@@ -1,0 +1,330 @@
+#!/bin/sh
+#
+# elpis-storage -- where Elpis keeps what survives a reboot.
+#
+#   elpis-storage boot            at startup (S05elpis-storage): find or make
+#                                 ELPIS-DATA, mount it, put settings back
+#   elpis-storage status          how this boot went
+#   elpis-storage init-disk DISK  add ELPIS-DATA to a disk an Elpis ISO was
+#                                 written to (used by elpis-copy-to-disk)
+#   elpis-storage format-blank DISK [--yes]
+#                                 make an empty disk into ELPIS-DATA, and keep
+#                                 settings there from now on
+#   elpis-storage request-reset   erase settings and updates at the next start
+
+PROG=elpis-storage
+. /usr/libexec/elpis/lib.sh
+
+usage() {
+	sed -n '3,14s/^# \{0,1\}//p' "$0"
+	exit 2
+}
+
+# ---- boot ------------------------------------------------------------------
+
+# Disks holding the ISO we were started from (the CD, the disk it was written
+# to, or both).
+media_disks() {
+	blkid -c /dev/null -t UUID="$1" -o device 2>/dev/null |
+		while read -r dev; do disk_of "$dev"; done | sort -u
+}
+
+# More than one: the one with the ELPIS-DATA GRUB used, else a disk over a
+# CD, else the first.
+pick_media_disk() {
+	local hint=$1 d dd
+	shift
+	if [ -n "$hint" ]; then
+		dd=$(blkid -c /dev/null -t UUID="$hint" -o device 2>/dev/null | head -n 1)
+		[ -n "$dd" ] && dd=$(disk_of "$dd")
+		for d in "$@"; do [ "$d" = "$dd" ] && { echo "$d"; return; }; done
+	fi
+	for d in "$@"; do case $d in sr*) ;; *) echo "$d"; return ;; esac; done
+	echo "$1"
+}
+
+clock_floor() {
+	# DNSSEC needs the right time; NTP sets it shortly (S48ntp).  Until then
+	# never run behind the image's build time or the last time saved here,
+	# which is closer than a machine with a flat clock battery would be.
+	local now best saved
+	now=$(date -u +%s)
+	best=$(release BUILD_EPOCH)
+	saved=$(cat "$DATA/clock" 2>/dev/null)
+	case $saved in '' | *[!0-9]*) saved=0 ;; esac
+	[ "${saved:-0}" -gt "${best:-0}" ] && best=$saved
+	if [ -n "$best" ] && [ "$now" -lt "$best" ]; then
+		date -u -s "@$best" >/dev/null 2>&1 &&
+			say "the clock was behind; set to $(date -u '+%Y-%m-%d %H:%M') UTC until NTP answers"
+	fi
+}
+
+merge_elpis_conf() {
+	# A restored elpis.conf was last merged with the defaults of the image
+	# that saved it.  When this image ships different defaults, bring them in
+	# the way the resolver's own make does, keeping the operator's edits.
+	local shipped=/usr/share/elpis/elpis.conf mine=/etc/elpis/elpis.conf
+	local base=/etc/elpis/elpis.conf.shipped
+	[ -f "$mine" ] || return 0
+	cmp -s "$shipped" "$base" 2>/dev/null && return 0
+	[ -f "$base" ] || cp "$shipped" "$base"
+	sh /usr/libexec/elpis/conf-merge.sh "$shipped" "$mine" "$base" 2>&1 |
+		logger -t elpis-conf-merge
+	cmp -s "$shipped" "$base" && {
+		store_path "$mine"
+		store_path "$base"
+		say "elpis.conf brought up to date with this version's defaults"
+	}
+	return 0
+}
+
+restore_config() {
+	local p n=0
+	[ -d "$CONFIG_STORE" ] || return 0
+	for p in $(keep_paths); do
+		if [ -e "$CONFIG_STORE$p" ]; then
+			restore_path "$p" && n=$((n + 1))
+		fi
+	done
+	merge_elpis_conf
+	hostname -F /etc/hostname 2>/dev/null
+	say "restored $n saved setting(s) from $DATA_DEV"
+}
+
+write_issue() {
+	local where
+	if [ "$MODE" = persistent ]; then
+		where="settings are kept on $DATA_DEV"
+	else
+		where="settings are in RAM only: ${REASON:-no ELPIS-DATA partition}"
+	fi
+	[ "$SAFE" = 1 ] && where="SAFE MODE: saved settings were not loaded; $where"
+	cat > /etc/issue <<-EOF
+
+	Elpis Linux $(release VERSION) (resolver $(release RESOLVER_VERSION)) on \\l
+	$where
+
+	EOF
+}
+
+do_boot() {
+	MEDIA_UUID=$(cmdline elpis.media)
+	SLOT=$(cmdline elpis.slot) || SLOT=builtin
+	SAFE=0; cmdline elpis.safe >/dev/null && SAFE=1
+	RESET=0; cmdline elpis.reset >/dev/null && RESET=1
+	HINT=$(cmdline elpis.data)
+	MODE=ram REASON= DATA_DEV= MEDIA_DISK= MEDIA_WRITABLE=no CREATED=0
+	local disks i=0 rc cands n
+
+	if [ -z "$MEDIA_UUID" ]; then
+		REASON="not started from the Elpis boot menu (no elpis.media=)"
+	else
+		# USB disks can take a few seconds to appear.
+		while :; do
+			disks=$(media_disks "$MEDIA_UUID")
+			[ -n "$disks" ] || [ $i -ge 10 ] && break
+			sleep 1
+			i=$((i + 1))
+		done
+		if [ -z "$disks" ]; then
+			REASON="the boot medium (ISO $MEDIA_UUID) was not found"
+		else
+			# shellcheck disable=SC2086
+			MEDIA_DISK=$(pick_media_disk "$HINT" $disks)
+		fi
+	fi
+
+	# 1. The disk the ISO was written to, when Elpis owns its layout.
+	if [ -n "$MEDIA_DISK" ] && disk_writable "$MEDIA_DISK"; then
+		if layout_ok "$MEDIA_UUID" "$MEDIA_DISK"; then
+			MEDIA_WRITABLE=yes
+			DATA_DEV=$(part_dev "$MEDIA_DISK" 3)
+			if [ ! -b "$DATA_DEV" ]; then
+				say "first start from /dev/$MEDIA_DISK: adding ELPIS-DATA"
+				create_data_part "$MEDIA_DISK"
+				rc=$?
+				if [ $rc = 0 ]; then
+					CREATED=1
+				else
+					[ $rc = 2 ] && REASON="/dev/$MEDIA_DISK has less than 256 MiB free after the ISO" ||
+						REASON="could not add ELPIS-DATA to /dev/$MEDIA_DISK"
+					DATA_DEV=
+				fi
+			elif [ -z "$(blk_value TYPE "$DATA_DEV")" ]; then
+				say "$DATA_DEV was never formatted; formatting it"
+				mkfs_data "$DATA_DEV" || { REASON="could not format $DATA_DEV"; DATA_DEV=; }
+			fi
+		else
+			REASON="/dev/$MEDIA_DISK holds partitions Elpis did not make, so it is left alone"
+		fi
+	fi
+
+	# 2. Otherwise ELPIS-DATA on another disk: the one GRUB used, or the only one.
+	if [ -z "$DATA_DEV" ] && [ "$MEDIA_WRITABLE" = no ]; then
+		if [ -n "$HINT" ]; then
+			i=0
+			while [ -z "$(blkid -c /dev/null -t UUID="$HINT" -o device 2>/dev/null)" ] && [ $i -lt 10 ]; do
+				sleep 1
+				i=$((i + 1))
+			done
+		fi
+		cands=$(blkid -c /dev/null -t LABEL="$DATA_LABEL" -o device 2>/dev/null |
+			while read -r dev; do
+				[ "$(disk_of "$dev")" = "$MEDIA_DISK" ] && continue
+				[ "$(blk_value TYPE "$dev")" = ext4 ] && echo "$dev"
+			done)
+		n=$(echo "$cands" | grep -c .)
+		if [ -n "$HINT" ]; then
+			for dev in $cands; do
+				[ "$(blk_value UUID "$dev")" = "$HINT" ] && DATA_DEV=$dev
+			done
+		fi
+		if [ -z "$DATA_DEV" ] && [ "$n" = 1 ]; then
+			DATA_DEV=$cands
+		elif [ -z "$DATA_DEV" ] && [ "$n" -gt 1 ]; then
+			REASON="more than one ELPIS-DATA partition ($(echo $cands)); none was used"
+		elif [ -z "$DATA_DEV" ] && [ -z "$REASON" ]; then
+			case $MEDIA_DISK in
+			sr*) REASON="started from a CD, and no disk holds ELPIS-DATA" ;;
+			*) REASON="/dev/$MEDIA_DISK cannot be written, and no disk holds ELPIS-DATA" ;;
+			esac
+		fi
+	fi
+
+	if [ -n "$DATA_DEV" ]; then
+		if [ "$RESET" = 1 ]; then
+			say "factory reset: erasing $DATA_DEV"
+			mkfs_data "$DATA_DEV"
+		fi
+		if mount_data "$DATA_DEV"; then
+			if [ -e "$DATA/.factory-reset" ]; then
+				say "factory reset requested: erasing $DATA_DEV"
+				umount "$DATA" && mkfs_data "$DATA_DEV" && mount_data "$DATA_DEV"
+				RESET=1
+			fi
+		fi
+		if data_mounted; then
+			MODE=persistent
+			mkdir -p "$CONFIG_STORE" "$SYSTEM_DIR"
+		else
+			REASON="ELPIS-DATA ($DATA_DEV) could not be mounted"
+			DATA_DEV=
+		fi
+	fi
+
+	state_write MODE="$MODE" REASON="$REASON" \
+		MEDIA_UUID="$MEDIA_UUID" MEDIA_DISK="$MEDIA_DISK" MEDIA_WRITABLE="$MEDIA_WRITABLE" \
+		DATA_DEV="$DATA_DEV" DATA_UUID="$(blk_value UUID "$DATA_DEV")" \
+		SLOT="$SLOT" SAFE="$SAFE" RESET="$RESET" CREATED="$CREATED" \
+		GRUBENV_WRITABLE="$(cmdline elpis.grubenv >/dev/null && echo no || echo yes)"
+
+	clock_floor
+
+	if [ "$MODE" = persistent ]; then
+		if [ "$SAFE" = 1 ]; then
+			say "safe mode: saved settings on $DATA_DEV were not restored"
+		else
+			restore_config
+		fi
+	else
+		warn "settings are in RAM only: $REASON"
+	fi
+	write_issue
+	return 0
+}
+
+do_stop() {
+	persistent || return 0
+	date -u +%s > "$DATA/clock"
+	sync
+}
+
+do_status() {
+	state_load
+	echo "running:   Elpis Linux $(release VERSION) build $(release BUILD_ID), slot ${SLOT:-?}"
+	echo "medium:    ISO ${MEDIA_UUID:-?} on /dev/${MEDIA_DISK:-?}"
+	if persistent; then
+		echo "settings:  kept on $DATA_DEV ($(df -h "$DATA" | awk 'NR == 2 { print $4 " free" }'))"
+	else
+		echo "settings:  RAM only -- ${REASON:-no ELPIS-DATA}"
+	fi
+	[ "$SAFE" = 1 ] && echo "           safe mode: saved settings were not loaded"
+	[ "$GRUBENV_WRITABLE" = no ] && echo "           GRUB could not write to ELPIS-DATA: updates are not started"
+	return 0
+}
+
+confirm_disk() {
+	local d=$1 answer
+	echo "This erases everything on /dev/$d:"
+	echo "  $(cat "/sys/block/$d/device/model" 2>/dev/null | tr -s ' ') $(( $(disk_sectors "$d") / 2048 )) MiB"
+	printf 'Type the disk name (%s) to go ahead: ' "$d"
+	read -r answer
+	[ "$answer" = "$d" ] || die "not confirmed; nothing was changed"
+}
+
+do_init_disk() {
+	local d=${1#/dev/} rc
+	[ -n "$d" ] || usage
+	state_load
+	disk_writable "$d" || die "/dev/$d cannot be written"
+	layout_ok "$MEDIA_UUID" "$d" || die "/dev/$d does not hold this Elpis ISO and nothing else"
+	[ -b "$(part_dev "$d" 3)" ] && { say "/dev/$d already has ELPIS-DATA"; return 0; }
+	create_data_part "$d"
+	rc=$?
+	[ $rc = 2 ] && die "/dev/$d has less than 256 MiB free after the ISO"
+	[ $rc = 0 ] || die "could not add ELPIS-DATA to /dev/$d"
+	say "added ELPIS-DATA as $(part_dev "$d" 3)"
+}
+
+do_format_blank() {
+	local d=${1#/dev/} yes=$2 p
+	[ -n "$d" ] || usage
+	state_load
+	[ "$d" != "$MEDIA_DISK" ] || die "/dev/$d is the boot medium"
+	disk_writable "$d" || die "/dev/$d cannot be written"
+	[ -z "$(disk_mounted_parts "$d")" ] || die "/dev/$d has mounted partitions"
+	[ -z "$(blkid -c /dev/null -p -o value -s PTTYPE "/dev/$d" 2>/dev/null)" ] &&
+		[ -z "$(blkid -c /dev/null -p -o value -s TYPE "/dev/$d" 2>/dev/null)" ] &&
+		cmp -s -n 1048576 "/dev/$d" /dev/zero ||
+		die "/dev/$d is not blank; only an empty disk is formatted here"
+	[ "$yes" = --yes ] || confirm_disk "$d"
+
+	echo 'start=2048, type=83' | sfdisk -q --wipe never "/dev/$d" || die "could not partition /dev/$d"
+	p=$(part_dev "$d" 1)
+	wait_for_block "$p" || die "$p did not appear"
+	mkfs_data "$p" || die "could not format $p"
+	say "made $p into ELPIS-DATA"
+
+	if ! persistent; then
+		mount_data "$p" || die "could not mount $p"
+		mkdir -p "$CONFIG_STORE" "$SYSTEM_DIR"
+		state_load
+		state_write MODE=persistent REASON= MEDIA_UUID="$MEDIA_UUID" MEDIA_DISK="$MEDIA_DISK" \
+			MEDIA_WRITABLE="$MEDIA_WRITABLE" DATA_DEV="$p" DATA_UUID="$(blk_value UUID "$p")" \
+			SLOT="$SLOT" SAFE="$SAFE" RESET=0 CREATED=1 GRUBENV_WRITABLE="$GRUBENV_WRITABLE"
+		elpis-save
+		DATA_DEV=$p
+		MODE=persistent
+		SAFE=0
+		write_issue
+		say "settings are kept on $p from now on"
+	fi
+}
+
+do_request_reset() {
+	persistent || die "there is no ELPIS-DATA to reset; settings are in RAM only"
+	: > "$DATA/.factory-reset"
+	grubenv_set next= tries= good=
+	sync
+	say "settings and updates will be erased at the next start"
+}
+
+case $1 in
+boot) do_boot ;;
+stop) do_stop ;;
+status) do_status ;;
+init-disk) do_init_disk "$2" ;;
+format-blank) do_format_blank "$2" "$3" ;;
+request-reset) do_request_reset ;;
+*) usage ;;
+esac

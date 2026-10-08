@@ -1,0 +1,60 @@
+#!/bin/sh
+#
+# elpis-save -- keep settings across reboots.
+#
+#   elpis-save            save every path in the keep list
+#   elpis-save PATH...    save these paths; one not in the keep list is added
+#                         to it (keep.list.local, on ELPIS-DATA)
+#   elpis-save --list     show the keep list and what is saved
+#
+# The system runs from RAM.  Only what is saved here is put back at the next
+# start, so a change to anything else lasts until the reboot.
+#
+# Exit status: 0 saved, 1 failed, 3 settings are in RAM only (no ELPIS-DATA).
+
+PROG=elpis-save
+. /usr/libexec/elpis/lib.sh
+
+if [ "$1" = -h ] || [ "$1" = --help ]; then
+	sed -n '3,14s/^# \{0,1\}//p' "$0"
+	exit 0
+fi
+
+if ! persistent; then
+	warn "settings are in RAM only (${REASON:-no ELPIS-DATA partition}); nothing can be saved"
+	exit 3
+fi
+
+if [ "$1" = --list ]; then
+	for p in $(keep_paths); do
+		if [ -e "$CONFIG_STORE$p" ]; then s=saved; else s="not saved"; fi
+		printf '%-40s %s\n' "$p" "$s"
+	done
+	exit 0
+fi
+
+mkdir -p "$CONFIG_STORE" || die "cannot write to $CONFIG_STORE"
+
+if [ $# = 0 ]; then
+	set -- $(keep_paths)
+else
+	for p in "$@"; do
+		case $p in
+		/*) ;;
+		*) die "$p: give an absolute path" ;;
+		esac
+		case $p in *[[:space:]]*) die "'$p': paths with spaces cannot be kept" ;; esac
+		if ! keep_paths | grep -qxF "$p"; then
+			echo "$p" >> "$KEEP_LIST_LOCAL" || die "cannot add $p to the keep list"
+			say "added $p to the keep list"
+		fi
+	done
+fi
+
+failed=0
+for p in "$@"; do
+	store_path "$p" || { warn "could not save $p"; failed=1; }
+done
+sync
+[ $failed = 0 ] || exit 1
+say "saved $# path(s) to $DATA_DEV"

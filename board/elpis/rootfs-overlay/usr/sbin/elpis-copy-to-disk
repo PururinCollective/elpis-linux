@@ -1,0 +1,137 @@
+#!/bin/sh
+#
+# elpis-copy-to-disk -- write this Elpis onto another disk, the way an ISO
+# writer (Etcher, dd) would, and give it ELPIS-DATA straight away.
+#
+#   elpis-copy-to-disk --list
+#   elpis-copy-to-disk --disk DISK [--keep-config] [--yes]
+#
+#   --keep-config   carry over the current settings, and the update that is
+#                   running if there is one
+#   --yes           do not ask for the disk name to be typed back
+#
+# The copy is the ISO this system started from, byte for byte, so it boots
+# the same way on BIOS and UEFI.  Two disks holding the same ISO are told
+# apart by their ELPIS-DATA, but remove the original medium before starting
+# from the copy if you can.
+
+PROG=elpis-copy-to-disk
+. /usr/libexec/elpis/lib.sh
+
+usage() {
+	sed -n '3,17s/^# \{0,1\}//p' "$0"
+	exit 2
+}
+
+disk_info() {
+	local d=$1 model serial
+	model=$(cat "/sys/block/$d/device/model" 2>/dev/null | tr -s ' ' | sed 's/ *$//')
+	serial=$(cat "/sys/block/$d/device/serial" "/sys/block/$d/serial" 2>/dev/null | head -n 1 | tr -d ' ')
+	printf '%s MiB  %s  %s' "$(( $(disk_sectors "$d") / 2048 ))" "${model:-?}" "${serial:--}"
+}
+
+do_list() {
+	local b d flags
+	state_load
+	printf '%-10s %s\n' DISK "SIZE  MODEL  SERIAL  [NOTES]"
+	for b in /sys/block/*; do
+		d=$(basename "$b")
+		case $d in loop* | ram* | zram* | dm-* | md* | mtdblock* | nbd*) continue ;; esac
+		[ "$(disk_sectors "$d")" -gt 0 ] 2>/dev/null || continue
+		flags=
+		[ "$d" = "$MEDIA_DISK" ] && flags="$flags boot-medium"
+		[ -n "$DATA_DEV" ] && [ "$(disk_of "$DATA_DEV")" = "$d" ] && flags="$flags settings"
+		[ -n "$(disk_mounted_parts "$d")" ] && flags="$flags mounted"
+		case $d in sr*) flags="$flags cd" ;; esac
+		disk_writable "$d" || flags="$flags read-only"
+		printf '%-10s %s%s\n' "$d" "$(disk_info "$d")" "${flags:+  [${flags# }]}"
+	done
+}
+
+# Size of the ISO image on the boot medium: it ends where its appended EFI
+# partition (MBR entry 2) ends.
+image_bytes() {
+	local d=$1 type start size
+	type=$(dd if="/dev/$d" bs=512 count=1 2>/dev/null | od -An -tx1 -j 466 -N 1 | tr -d ' ')
+	[ "$type" = ef ] || return 1
+	set -- $(dd if="/dev/$d" bs=512 count=1 2>/dev/null | od -An -tu4 -j 470 -N 8)
+	start=$1 size=$2
+	[ -n "$size" ] && [ "$size" -gt 0 ] || return 1
+	echo $(( (start + size) * 512 ))
+}
+
+do_copy() {
+	local t= keep=0 yes=0 bytes blocks answer slot tdata tmnt p
+	while [ $# -gt 0 ]; do
+		case $1 in
+		--disk) t=${2#/dev/}; shift ;;
+		--keep-config) keep=1 ;;
+		--yes) yes=1 ;;
+		*) usage ;;
+		esac
+		shift
+	done
+	[ -n "$t" ] || usage
+	state_load
+	[ -n "$MEDIA_DISK" ] || die "the boot medium was not found at startup; nothing to copy from"
+	[ -e "/sys/block/$t" ] || die "/dev/$t is not a disk (give a whole disk, like sdb or nvme0n1)"
+	[ "$t" != "$MEDIA_DISK" ] || die "/dev/$t is the medium this system started from"
+	disk_writable "$t" || die "/dev/$t cannot be written"
+	[ -z "$(disk_mounted_parts "$t")" ] || die "/dev/$t has mounted partitions: $(disk_mounted_parts "$t" | tr '\n' ' ')"
+
+	bytes=$(image_bytes "$MEDIA_DISK") || die "could not find the ISO's size on /dev/$MEDIA_DISK"
+	blocks=$(( (bytes + 2047) / 2048 ))
+	[ $(( $(disk_sectors "$t") * 512 )) -ge $(( bytes + DATA_MIN_SECTORS * 512 )) ] ||
+		die "/dev/$t is too small: the ISO and the smallest ELPIS-DATA need $(( bytes / 1048576 + DATA_MIN_SECTORS / 2048 )) MiB"
+
+	if [ $yes = 0 ]; then
+		echo "This erases everything on /dev/$t: $(disk_info "$t")"
+		printf 'Type the disk name (%s) to go ahead: ' "$t"
+		read -r answer
+		[ "$answer" = "$t" ] || die "not confirmed; nothing was changed"
+	fi
+
+	say "writing the ISO ($((bytes / 1048576)) MiB) from /dev/$MEDIA_DISK to /dev/$t"
+	# Clear the old partition table first, so nothing on the disk is taken for
+	# a partition while it is being written.
+	dd if=/dev/zero of="/dev/$t" bs=1M count=1 conv=fsync 2>/dev/null
+	dd if="/dev/$MEDIA_DISK" of="/dev/$t" bs=2048 count=$blocks conv=fsync 2>/dev/null ||
+		die "writing /dev/$t failed"
+	blockdev --rereadpt "/dev/$t" 2>/dev/null || partx -u "/dev/$t" 2>/dev/null
+	sleep 1
+
+	elpis-storage init-disk "$t" || die "the ISO is on /dev/$t, but ELPIS-DATA could not be added; it will try again when started from it"
+	tdata=$(part_dev "$t" 3)
+
+	if [ $keep = 1 ]; then
+		tmnt=$ELPIS_RUN/copy-target
+		mkdir -p "$tmnt"
+		mount -t ext4 "$tdata" "$tmnt" || die "could not mount $tdata"
+		mkdir -p "$tmnt/config" "$tmnt/system"
+		if persistent; then
+			cp -a "$CONFIG_STORE/." "$tmnt/config/"
+		else
+			for p in $(keep_paths); do store_path "$p" "$tmnt/config"; done
+		fi
+		slot=$(cmdline elpis.slot) || slot=builtin
+		if [ "$slot" != builtin ] && [ -d "$SYSTEM_DIR/$slot" ]; then
+			cp -a "$SYSTEM_DIR/$slot" "$tmnt/system/"
+			p=$GRUBENV
+			GRUBENV=$tmnt/grubenv
+			grubenv_set base="$MEDIA_UUID" good="$slot"
+			GRUBENV=$p
+			say "carried over the running update, $slot"
+		fi
+		sync
+		umount "$tmnt"
+		say "carried over the settings"
+	fi
+	sync
+	say "done: /dev/$t starts this Elpis, with its settings on $tdata"
+}
+
+case $1 in
+--list | list) do_list ;;
+--disk) do_copy "$@" ;;
+*) usage ;;
+esac

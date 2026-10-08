@@ -1,0 +1,33 @@
+#!/bin/sh
+#
+# Started once by init after boot.  Waits for the resolver to answer on
+# 127.0.0.1 -- localhost is answered locally, so no network is needed --
+# and then tells elpis-update the running version works.
+#
+# An update on trial that never answers is not kept running: after
+# HEALTH_TIMEOUT seconds the machine restarts, so that GRUB counts the try and,
+# after the third, goes back to the version that worked.
+
+PROG=elpis-health
+. /usr/libexec/elpis/lib.sh
+
+HEALTH_TIMEOUT=${HEALTH_TIMEOUT:-180}
+waited=0
+while [ "$waited" -lt "$HEALTH_TIMEOUT" ]; do
+	if nslookup localhost 127.0.0.1 >/dev/null 2>&1; then
+		echo up > "$ELPIS_RUN/health"
+		elpis-update --mark-good
+		exit 0
+	fi
+	sleep 5
+	waited=$((waited + 5))
+done
+
+echo down > "$ELPIS_RUN/health"
+warn "the resolver has not answered on 127.0.0.1 for ${HEALTH_TIMEOUT}s"
+running=$(cmdline elpis.slot) || running=builtin
+if persistent && [ "$running" != builtin ] && [ "$running" = "$(grubenv_get next)" ]; then
+	warn "$running is on trial and does not answer: restarting so GRUB can count the try"
+	sync
+	reboot
+fi

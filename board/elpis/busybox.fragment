@@ -1,0 +1,23 @@
+# Applied on top of Buildroot's busybox.config.
+
+# One-shot clock set before Elpis starts, then kept in step
+CONFIG_NTPD=y
+# CONFIG_FEATURE_NTPD_SERVER is not set
+
+# The log lives in a RAM ring buffer, read with logread
+CONFIG_FEATURE_IPC_SYSLOG=y
+CONFIG_FEATURE_IPC_SYSLOG_BUFFER_SIZE=256
+CONFIG_LOGREAD=y
+CONFIG_FEATURE_LOGREAD_REDUCED_LOCKING=y
+
+# Used by the elpis-* scripts
+CONFIG_FEATURE_SYNC_FANCY=y
+CONFIG_TIMEOUT=y
+CONFIG_STAT=y
+CONFIG_FEATURE_STAT_FORMAT=y
+CONFIG_PGREP=y
+CONFIG_PKILL=y
+
+# elpis-update fetches over https.  BusyBox does not check certificates;
+# the minisign signature is what makes an update trustworthy.
+CONFIG_FEATURE_WGET_HTTPS=y
