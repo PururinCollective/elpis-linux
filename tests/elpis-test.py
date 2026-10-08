@@ -168,7 +168,7 @@ class VM:
         """Run COMMAND in the logged-in shell; return (status, output)."""
         marker = f"__RC{int(time.time() * 1000) % 100000000}__"
         self.send(f"{command}; echo {marker}$?{marker}\n")
-        m = self.expect(re.escape(marker) + rb"(\d+)" + re.escape(marker), timeout)
+        m = self.expect(re.escape(marker) + r"(\d+)" + re.escape(marker), timeout)
         with self.lock:
             text = self.buf[:m.start()]
         out = text[text.rfind(PROMPT.encode()) + len(PROMPT):].decode(errors="replace") \

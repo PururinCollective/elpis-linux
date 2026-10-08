@@ -25,9 +25,13 @@ set args="elpis.media=@ISO_UUID@ console=ttyS0,115200 console=tty0 panic=10 quie
 # otherwise any disk's.
 set data=
 regexp --set=1:isodisk '^([^,]+)' "$iso"
-if probe --set=lbl --label "(${isodisk},msdos3)"; then
-	if [ "$lbl" = "ELPIS-DATA" ]; then
-		set data="${isodisk},msdos3"
+# (Each lookup is guarded so that a missing partition or file does not
+# print an error on the console.)
+if [ -d "(${isodisk},msdos3)/" ]; then
+	if probe --set=lbl --label "(${isodisk},msdos3)"; then
+		if [ "$lbl" = "ELPIS-DATA" ]; then
+			set data="${isodisk},msdos3"
+		fi
 	fi
 fi
 if [ -z "$data" ]; then
@@ -43,7 +47,9 @@ if [ -n "$data" ]; then
 	set tries=
 	set good=
 	set base=
-	load_env --file "($data)/grubenv" --skip-sig next tries good base
+	if [ -f "($data)/grubenv" ]; then
+		load_env --file "($data)/grubenv" --skip-sig next tries good base
+	fi
 	if [ "$base" = "$iso_uuid" ]; then
 		if [ -n "$next" ]; then
 			if [ "$tries" = 3 ]; then
