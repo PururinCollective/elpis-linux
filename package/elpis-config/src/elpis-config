@@ -1,0 +1,1159 @@
+#!/bin/sh
+#
+# elpis-config -- set up the Elpis appliance.
+#
+#   elpis-config                the menu
+#   elpis-config --console      what the screen (tty1) runs: the setup guide
+#                               when nothing is set up yet, then the menu
+#   elpis-config --wizard       the setup guide
+#
+# The same settings without the dialogs, for scripts.  Each checks what it is
+# given, applies it, and keeps it with elpis-save:
+#
+#   elpis-config status
+#   elpis-config get KEY
+#   elpis-config set KEY [VALUE...]   a resolver setting in elpis.conf:
+#                       listen, access-control   (lists: one VALUE each)
+#                       dnssec, authoritative-dot, ecs, identity, webgui,
+#                       webgui-password, licence (one VALUE; none removes it)
+#   elpis-config webgui-password      the status page password, read from stdin
+#   elpis-config hostname NAME
+#   elpis-config network [--iface IF] [--ipv4 dhcp|ADDR/LEN] [--gw4 ADDR]
+#                        [--ipv6 auto|ADDR/LEN] [--gw6 ADDR] [--trial SECONDS]
+#   elpis-config network --keep | --revert
+#                       --trial applies the change and undoes it after
+#                       SECONDS unless "network --keep" comes first
+#   elpis-config ntp ADDR...
+#   elpis-config root-password        read from stdin
+#   elpis-config ssh on|off
+#   elpis-config ssh-key add KEY | clear
+#   elpis-config needs-setup          exit 0 while the setup guide has not run
+#
+# ELPIS_ROOT=DIR works on the files under DIR instead of /, and only says what
+# it would run: for trying a change on a copy.
+
+PROG=elpis-config
+ROOT=${ELPIS_ROOT:-}
+[ "$ROOT" = / ] && ROOT=
+# shellcheck source=../../../board/elpis/rootfs-overlay/usr/libexec/elpis/lib.sh
+. "${ELPIS_LIB:-/usr/libexec/elpis/lib.sh}"
+if [ -n "$ROOT" ]; then
+	ELPIS_RUN=$ROOT/run/elpis
+	ELPIS_STATE=$ELPIS_RUN/state
+	DATA=$ROOT/data
+	CONFIG_STORE=$DATA/config
+fi
+
+CONF=$ROOT/etc/elpis/elpis.conf
+SHIPPED_CONF=$ROOT/usr/share/elpis/elpis.conf
+IFACES=$ROOT/etc/network/interfaces
+HOSTNAME_FILE=$ROOT/etc/hostname
+HOSTS_FILE=$ROOT/etc/hosts
+NTP_CONF=$ROOT/etc/elpis/ntp.conf
+SSH_CONF=$ROOT/etc/elpis/ssh.conf
+SHADOW=$ROOT/etc/shadow
+AUTH_KEYS=$ROOT/root/.ssh/authorized_keys
+ELPIS=${ELPIS_BIN:-/usr/sbin/elpis}
+IPCHECK=${ELPIS_IPCHECK:-/usr/libexec/elpis/elpis-ipcheck}
+SETUP_DONE=$CONFIG_STORE/.setup-done
+SETUP_DONE_RAM=$ELPIS_RUN/setup-done
+IDENTITY_NAME=elpis.sakurako.oomuro
+
+# ---- plumbing ----------------------------------------------------------------
+
+# Run a command that changes the running system; under ELPIS_ROOT, only say so.
+sys() {
+	if [ -n "$ROOT" ]; then
+		echo "would run: $*"
+		return 0
+	fi
+	"$@"
+}
+
+# Keep paths (given as on the running system) with elpis-save.  Settings that
+# are in RAM only are not an error here: the banner says so.
+keep() {
+	if [ -n "$ROOT" ]; then
+		echo "would save: $*"
+		return 0
+	fi
+	elpis-save "$@" >/dev/null 2>&1
+	case $? in
+	0 | 3) return 0 ;;
+	*) warn "could not save $*"; return 1 ;;
+	esac
+}
+
+ipcheck() {
+	"$IPCHECK" "$@" >/dev/null 2>&1
+}
+
+restart_resolver() {
+	sys /etc/init.d/S50elpis restart >/dev/null 2>&1
+}
+
+# ---- elpis.conf ------------------------------------------------------------------
+# Only the keys below are ever touched; every other line, comment and blank
+# stays exactly as it is.
+
+LIST_KEYS="listen access-control"
+SINGLE_KEYS="dnssec authoritative-dot ecs identity webgui webgui-password licence"
+
+is_list_key() {
+	case " $LIST_KEYS " in *" $1 "*) return 0 ;; esac
+	return 1
+}
+
+is_managed_key() {
+	case " $LIST_KEYS $SINGLE_KEYS " in *" $1 "*) return 0 ;; esac
+	return 1
+}
+
+# The active values of KEY, one per line, without trailing comments.
+conf_get() {
+	K=$1 awk 'BEGIN { k = ENVIRON["K"] }
+		index($0, k ":") == 1 {
+			v = substr($0, length(k) + 2)
+			sub(/^[ \t]+/, "", v); sub(/[ \t]+#.*$/, "", v); sub(/[ \t]+$/, "", v)
+			print v
+		}' "${2:-$CONF}"
+}
+
+# conf_edit FILE KEY VALUE...  -- rewrite FILE with KEY set to the VALUEs.
+#
+# The new lines replace the first active KEY line, and every other active KEY
+# line goes.  With none active, they go after the last commented example
+# ("# KEY: ..."), or at the end.  A single key keeps a trailing comment.  No
+# VALUE removes the key.
+conf_edit() {
+	local file="$1" key="$2"
+	shift 2
+	K=$key V=$(printf '%s\n' "$@") awk '
+	BEGIN { k = ENVIRON["K"]; n = split(ENVIRON["V"], v, "\n"); while (n > 0 && v[n] == "") n-- }
+	{ line[NR] = $0 }
+	function active(s) { return index(s, k ":") == 1 }
+	function example(s) { return s ~ /^#[ \t]*/ && index(substr(s, match(s, /[^# \t]/)), k ":") == 1 }
+	function emit(keepc,   j, c) {
+		c = ""
+		if (keepc != "" && n == 1 && match(keepc, /[ \t]+#.*$/)) c = substr(keepc, RSTART)
+		for (j = 1; j <= n; j++) print k ": " v[j] (j == 1 ? c : "")
+	}
+	END {
+		first = 0; ex = 0
+		for (i = 1; i <= NR; i++) {
+			if (active(line[i])) { if (!first) first = i }
+			else if (example(line[i])) ex = i
+		}
+		for (i = 1; i <= NR; i++) {
+			if (active(line[i])) { if (i == first) emit(line[i]); continue }
+			print line[i]
+			if (!first && i == ex) emit("")
+		}
+		if (!first && !ex) emit("")
+	}' "$file"
+}
+
+# Check one value for KEY; say what is wrong on stderr.
+conf_value_ok() {
+	local key="$1" val="$2" a p net act
+	case $key in
+	listen)
+		a=${val%@*}
+		p=${val##*@}
+		[ "$a" != "$val" ] || { warn "listen '$val': give ADDRESS@PORT"; return 1; }
+		case $p in '' | *[!0-9]*) warn "listen '$val': bad port"; return 1 ;; esac
+		if [ "$p" -lt 1 ] || [ "$p" -gt 65535 ]; then warn "listen '$val': bad port"; return 1; fi
+		case $a in
+		\[*\]) ipcheck addr 6 "$(echo "$a" | tr -d '[]')" || { warn "listen '$val': bad IPv6 address"; return 1; } ;;
+		*) ipcheck addr 4 "$a" || { warn "listen '$val': bad IPv4 address (IPv6 goes in [brackets])"; return 1; } ;;
+		esac
+		;;
+	access-control)
+		net=${val%% *}
+		act=${val#* }
+		[ "$act" != "$val" ] || act=allow
+		ipcheck prefix any "$net" || { warn "access-control '$val': give a network like 192.168.1.0/24"; return 1; }
+		case $act in
+		allow | allow_snoop | deny | refuse) ;;
+		*) warn "access-control '$val': the action is allow, allow_snoop, deny or refuse"; return 1 ;;
+		esac
+		;;
+	dnssec | ecs | identity | webgui)
+		case $val in yes | no) ;; *) warn "$key: yes or no"; return 1 ;; esac
+		;;
+	authoritative-dot)
+		case $val in no | opportunistic) ;; *) warn "$key: no or opportunistic"; return 1 ;; esac
+		;;
+	webgui-password)
+		# shellcheck disable=SC2016
+		case $val in
+		'$pbkdf2-sha256$'*) ;;
+		*) warn "webgui-password: only a hash is stored here; use 'elpis-config webgui-password'"; return 1 ;;
+		esac
+		;;
+	licence)
+		case $val in
+		*[!A-Za-z0-9._-]* | '') warn "licence: that does not look like a licence token"; return 1 ;;
+		esac
+		;;
+	*)
+		warn "$key is not a setting elpis-config manages"
+		return 1
+		;;
+	esac
+	return 0
+}
+
+# Does FILE pass the resolver's own check?  "elpis -t" exits 0 even when it
+# kept defaults for settings it could not read, so its ERROR lines count too.
+conf_check() {
+	local out rc=0
+	out=$("$ELPIS" -t -c "$1" 2>&1) || rc=$?
+	if [ $rc != 0 ] || echo "$out" | grep -qE ' ERROR |configuration error'; then
+		echo "$out" | grep -E ' ERROR |configuration error' >&2
+		return 1
+	fi
+	return 0
+}
+
+# conf_apply KEY VALUE... -- edit, check, install, keep, restart.
+conf_apply() {
+	local key="$1" v tmp
+	shift
+	is_managed_key "$key" || die "$key is not a setting elpis-config manages ($LIST_KEYS $SINGLE_KEYS)"
+	if ! is_list_key "$key" && [ $# -gt 1 ]; then
+		die "$key takes one value"
+	fi
+	[ "$key" = listen ] && [ $# = 0 ] && die "listen needs at least one ADDRESS@PORT"
+	for v in "$@"; do
+		conf_value_ok "$key" "$v" || return 1
+	done
+	tmp=$CONF.new.$$
+	conf_edit "$CONF" "$key" "$@" > "$tmp" || { rm -f "$tmp"; die "could not edit $CONF"; }
+	if ! conf_check "$tmp"; then
+		rm -f "$tmp"
+		warn "the resolver does not accept that; nothing was changed"
+		return 1
+	fi
+	cat "$tmp" > "$CONF" || die "could not write $CONF"
+	rm -f "$tmp"
+	keep /etc/elpis/elpis.conf /etc/elpis/elpis.conf.shipped
+	restart_resolver
+	say "$key set; the resolver restarts, and its cache starts empty"
+	return 0
+}
+
+# ---- network ------------------------------------------------------------------
+
+interfaces() {
+	local i
+	for i in "$ROOT"/sys/class/net/* /sys/class/net/*; do
+		[ -e "$i" ] || continue
+		i=$(basename "$i")
+		case $i in lo | sit* | tunl* | ip6tnl* | dummy* | bond_* ) continue ;; esac
+		echo "$i"
+	done | sort -u
+}
+
+default_iface() {
+	local i
+	i=$(sed -n 's/^iface \([^ ]*\) inet .*/\1/p' "$IFACES" 2>/dev/null | grep -v '^lo$' | head -n 1)
+	[ -n "$i" ] || i=$(interfaces | head -n 1)
+	echo "${i:-eth0}"
+}
+
+# The settings in /etc/network/interfaces for IF, as shell assignments:
+# V4 (dhcp/static) V4ADDR V4MASK V4GW V6 (auto/static) V6ADDR V6LEN V6GW
+net_read() {
+	IF=$1 awk '
+	BEGIN { i = ENVIRON["IF"]; v4 = "dhcp"; v6 = "auto" }
+	$1 == "iface" { cur = ($2 == i) ? $3 : ""; if (cur == "inet") v4 = $4; if (cur == "inet6") v6 = $4; next }
+	cur == "inet" && $1 == "address" { a4 = $2 }
+	cur == "inet" && $1 == "netmask" { m4 = $2 }
+	cur == "inet" && $1 == "gateway" { g4 = $2 }
+	cur == "inet6" && $1 == "address" { a6 = $2 }
+	cur == "inet6" && $1 == "netmask" { l6 = $2 }
+	cur == "inet6" && $1 == "gateway" { g6 = $2 }
+	END {
+		if (v6 != "static") v6 = "auto"
+		printf "V4=%s V4ADDR=%s V4MASK=%s V4GW=%s V6=%s V6ADDR=%s V6LEN=%s V6GW=%s\n",
+			v4, a4, m4, g4, v6, a6, l6, g6
+	}' "$IFACES" 2>/dev/null
+}
+
+mask_to_len() {
+	local m="$1" n=0 o
+	local IFS=.
+	# shellcheck disable=SC2086
+	set -- $m
+	for o in "$@"; do
+		case $o in
+		255) n=$((n + 8)) ;; 254) n=$((n + 7)) ;; 252) n=$((n + 6)) ;; 248) n=$((n + 5)) ;;
+		240) n=$((n + 4)) ;; 224) n=$((n + 3)) ;; 192) n=$((n + 2)) ;; 128) n=$((n + 1)) ;;
+		esac
+	done
+	echo "$n"
+}
+
+net_write() {
+	# net_write IF V4 ADDR/LEN GW4 V6 ADDR/LEN GW6
+	local ifc="$1" v4="$2" a4="$3" g4="$4" v6="$5" a6="$6" g6="$7"
+	{
+		echo "# /etc/network/interfaces -- written by elpis-config"
+		echo
+		echo "auto lo"
+		echo "iface lo inet loopback"
+		echo
+		echo "auto $ifc"
+		if [ "$v4" = dhcp ]; then
+			echo "iface $ifc inet dhcp"
+			echo "  hostname \$(hostname)"
+		else
+			echo "iface $ifc inet static"
+			echo "  address ${a4%/*}"
+			echo "  netmask $("$IPCHECK" netmask "${a4#*/}")"
+			[ -n "$g4" ] && echo "  gateway $g4"
+		fi
+		if [ "$v6" = static ]; then
+			echo
+			echo "iface $ifc inet6 static"
+			echo "  address ${a6%/*}"
+			echo "  netmask ${a6#*/}"
+			[ -n "$g6" ] && echo "  gateway $g6"
+		fi
+	} > "$IFACES.new" && mv -f "$IFACES.new" "$IFACES"
+}
+
+net_restart() {
+	local ifc="$1"
+	if [ -n "$ROOT" ]; then
+		echo "would restart networking on $ifc"
+		return 0
+	fi
+	ifdown -f "$ifc" >/dev/null 2>&1
+	ip -4 addr flush dev "$ifc" scope global 2>/dev/null
+	ip -6 addr flush dev "$ifc" scope global 2>/dev/null
+	ip link set "$ifc" down 2>/dev/null
+	ip link set "$ifc" up 2>/dev/null
+	ifup "$ifc" >/dev/null 2>&1
+}
+
+TRIAL=$ELPIS_RUN/net-trial
+PREVIOUS=$ELPIS_RUN/interfaces.previous
+
+net_trial_running() {
+	[ -f "$TRIAL" ]
+}
+
+net_keep() {
+	local pid
+	pid=$(cat "$TRIAL" 2>/dev/null)
+	rm -f "$TRIAL"
+	[ -n "$pid" ] && kill "$pid" 2>/dev/null
+	rm -f "$PREVIOUS"
+	keep /etc/network/interfaces
+}
+
+net_revert() {
+	[ -f "$PREVIOUS" ] || die "no network change to undo"
+	cp "$PREVIOUS" "$IFACES"
+	rm -f "$TRIAL" "$PREVIOUS"
+	net_restart "$(default_iface)"
+	say "the previous network settings are back"
+}
+
+# cmd_network [--iface IF] [--ipv4 ...] [--gw4 ...] [--ipv6 ...] [--gw6 ...] [--trial S]
+cmd_network() {
+	local ifc v4 a4 g4 v6 a6 g6 trial='' setv4='' setv6=''
+	case $1 in
+	--keep) net_trial_running || die "no network change is waiting to be kept"; net_keep; say "network settings kept"; return ;;
+	--revert) net_revert; return ;;
+	esac
+	ifc=$(default_iface)
+	eval "$(net_read "$ifc")"
+	v4=$V4 g4=$V4GW v6=$V6 g6=$V6GW
+	a4=$V4ADDR/$(mask_to_len "$V4MASK")
+	a6=$V6ADDR/$V6LEN
+	while [ $# -gt 0 ]; do
+		case $1 in
+		--iface) ifc=$2; shift ;;
+		--ipv4)
+			setv4=1
+			if [ "$2" = dhcp ]; then v4=dhcp; g4=
+			else v4=static; a4=$2; fi
+			shift ;;
+		--gw4) g4=$2; shift ;;
+		--ipv6)
+			setv6=1
+			if [ "$2" = auto ]; then v6=auto; g6=
+			else v6=static; a6=$2; fi
+			shift ;;
+		--gw6) g6=$2; shift ;;
+		--trial) trial=$2; shift ;;
+		*) die "network: unknown option $1" ;;
+		esac
+		shift
+	done
+	[ -n "$setv4$setv6$g4$g6" ] || die "network: nothing to change (see elpis-config --help)"
+	if [ "$v4" = static ]; then
+		ipcheck prefix 4 "$a4" || die "IPv4 address '$a4': give ADDRESS/LENGTH, like 192.168.1.53/24"
+		[ -z "$g4" ] || ipcheck addr 4 "$g4" || die "IPv4 gateway '$g4' is not an address"
+	fi
+	if [ "$v6" = static ]; then
+		ipcheck prefix 6 "$a6" || die "IPv6 address '$a6': give ADDRESS/LENGTH, like 2001:db8::53/64"
+		[ -z "$g6" ] || ipcheck addr 6 "$g6" || die "IPv6 gateway '$g6' is not an address"
+	fi
+	case $trial in '' | *[!0-9]*) [ -z "$trial" ] || die "--trial takes seconds" ;; esac
+	net_trial_running && die "a network change is already on trial: keep it or undo it first"
+
+	mkdir -p "$ELPIS_RUN"
+	cp "$IFACES" "$PREVIOUS" 2>/dev/null || : > "$PREVIOUS"
+	net_write "$ifc" "$v4" "$a4" "$g4" "$v6" "$a6" "$g6" || die "could not write $IFACES"
+	if [ -n "$trial" ] && [ -z "$ROOT" ]; then
+		# Outlives the session: over SSH the change may cut this connection.
+		setsid sh -c "echo \$\$ > '$TRIAL'; sleep $trial; [ -f '$TRIAL' ] && exec elpis-config network --revert" \
+			</dev/null >/dev/null 2>&1 &
+		i=0
+		while [ ! -s "$TRIAL" ] && [ $i -lt 20 ]; do sleep 0.1 2>/dev/null || sleep 1; i=$((i + 1)); done
+		net_restart "$ifc"
+		say "applied on $ifc; undone in ${trial}s unless 'elpis-config network --keep'"
+	else
+		net_restart "$ifc"
+		rm -f "$PREVIOUS"
+		keep /etc/network/interfaces
+		say "network settings applied and kept"
+	fi
+}
+
+# ---- the other settings ----------------------------------------------------------
+
+cmd_hostname() {
+	local name="$1"
+	case $name in
+	'' | -* | *- | *[!A-Za-z0-9-]*) die "hostname: letters, digits and '-', not at either end" ;;
+	esac
+	[ ${#name} -le 63 ] || die "hostname: 63 characters at most"
+	echo "$name" > "$HOSTNAME_FILE" || die "could not write $HOSTNAME_FILE"
+	if [ -f "$HOSTS_FILE" ]; then
+		N=$name awk '$1 == "127.0.1.1" { print "127.0.1.1\t" ENVIRON["N"]; next } { print }' \
+			"$HOSTS_FILE" > "$HOSTS_FILE.new" && mv -f "$HOSTS_FILE.new" "$HOSTS_FILE"
+	fi
+	sys hostname "$name"
+	keep /etc/hostname
+}
+
+cmd_ntp() {
+	local s
+	[ $# -gt 0 ] || die "ntp: give one or more server addresses"
+	for s in "$@"; do
+		ipcheck addr any "$s" || die "ntp: '$s' is not an address (names cannot be looked up before the resolver runs)"
+	done
+	if ! {
+		echo "# NTP servers, by address: at boot nothing can be looked up by name yet."
+		echo "# The clock must be right before DNSSEC validation can work."
+		for s in "$@"; do echo "server $s"; done
+	} > "$NTP_CONF.new" || ! mv -f "$NTP_CONF.new" "$NTP_CONF"; then
+		die "could not write $NTP_CONF"
+	fi
+	keep /etc/elpis/ntp.conf
+	sys /etc/init.d/S48ntp restart >/dev/null 2>&1
+}
+
+ntp_servers() {
+	sed -e 's/#.*//' "$NTP_CONF" 2>/dev/null | awk '$1 == "server" { printf "%s ", $2 }' | sed 's/ $//'
+}
+
+# The status page password: plain text in on stdin, a hash in elpis.conf.
+cmd_webgui_password() {
+	local pw hash
+	IFS= read -r pw || die "no password given"
+	[ ${#pw} -ge 8 ] || die "use at least 8 characters"
+	hash=$(printf '%s\n' "$pw" | "$ELPIS" --hash-password 2>/dev/null | sed -n 's/^webgui-password: *//p')
+	[ -n "$hash" ] || die "the resolver did not hash the password"
+	conf_apply webgui-password "$hash"
+}
+
+cmd_root_password() {
+	local pw hash
+	IFS= read -r pw || die "no password given"
+	[ ${#pw} -ge 8 ] || die "use at least 8 characters"
+	hash=$(printf '%s\n' "$pw" | mkpasswd -P 0 -m sha512 2>/dev/null)
+	# shellcheck disable=SC2016
+	case $hash in '$6$'*) ;; *) die "could not hash the password" ;; esac
+	if ! H=$hash awk -F: 'BEGIN { OFS = ":" } $1 == "root" { $2 = ENVIRON["H"] } { print }' \
+		"$SHADOW" > "$SHADOW.new" || ! chmod 600 "$SHADOW.new" || ! mv -f "$SHADOW.new" "$SHADOW"; then
+		die "could not write $SHADOW"
+	fi
+	keep /etc/shadow
+	say "root password set"
+}
+
+root_has_password() {
+	local h
+	h=$(awk -F: '$1 == "root" { print $2 }' "$SHADOW" 2>/dev/null)
+	case $h in '' | '*' | '!'*) return 1 ;; esac
+	return 0
+}
+
+# Does PASSWORD (stdin) match root's?
+root_password_ok() {
+	local pw h method salt
+	IFS= read -r pw
+	h=$(awk -F: '$1 == "root" { print $2 }' "$SHADOW" 2>/dev/null)
+	# shellcheck disable=SC2016
+	case $h in
+	'$1$'*) method=md5 ;; '$5$'*) method=sha256 ;; '$6$'*) method=sha512 ;; *) return 1 ;;
+	esac
+	salt=$(echo "$h" | cut -d'$' -f3)
+	[ "$(printf '%s\n' "$pw" | mkpasswd -P 0 -m "$method" -S "$salt" 2>/dev/null)" = "$h" ]
+}
+
+ssh_enabled() {
+	grep -q '^SSH=yes' "$SSH_CONF" 2>/dev/null
+}
+
+cmd_ssh() {
+	case $1 in
+	on)
+		echo "SSH=yes" > "$SSH_CONF"
+		if [ -z "$ROOT" ]; then
+			mkdir -p /etc/dropbear
+			[ -f /etc/dropbear/dropbear_ed25519_host_key ] ||
+				dropbearkey -t ed25519 -f /etc/dropbear/dropbear_ed25519_host_key >/dev/null 2>&1
+			[ -f /etc/dropbear/dropbear_ecdsa_host_key ] ||
+				dropbearkey -t ecdsa -f /etc/dropbear/dropbear_ecdsa_host_key >/dev/null 2>&1
+		fi
+		keep /etc/elpis/ssh.conf /etc/dropbear
+		sys /etc/init.d/S50dropbear restart >/dev/null 2>&1
+		if ! root_has_password && [ ! -s "$AUTH_KEYS" ]; then
+			warn "SSH is on, but root has no password and no keys: nobody can log in yet"
+		fi
+		;;
+	off)
+		echo "SSH=no" > "$SSH_CONF"
+		keep /etc/elpis/ssh.conf
+		sys /etc/init.d/S50dropbear stop >/dev/null 2>&1
+		;;
+	*) die "ssh on|off" ;;
+	esac
+}
+
+cmd_ssh_key() {
+	case $1 in
+	add)
+		shift
+		case $* in
+		ssh-* | ecdsa-* | sk-*) ;;
+		*) die "that does not look like an SSH public key (ssh-ed25519 AAAA... comment)" ;;
+		esac
+		mkdir -p "$(dirname "$AUTH_KEYS")" && chmod 700 "$(dirname "$AUTH_KEYS")"
+		if ! echo "$*" >> "$AUTH_KEYS" || ! chmod 600 "$AUTH_KEYS"; then
+			die "could not write $AUTH_KEYS"
+		fi
+		keep /root/.ssh
+		;;
+	clear)
+		rm -f "$AUTH_KEYS"
+		keep /root/.ssh
+		;;
+	*) die "ssh-key add KEY | clear" ;;
+	esac
+}
+
+needs_setup() {
+	if persistent; then
+		[ ! -e "$SETUP_DONE" ]
+	else
+		[ ! -e "$SETUP_DONE_RAM" ]
+	fi
+}
+
+setup_done() {
+	mkdir -p "$ELPIS_RUN"
+	: > "$SETUP_DONE_RAM"
+	if persistent; then : > "$SETUP_DONE"; sync; fi
+}
+
+# ---- status ------------------------------------------------------------------
+
+resolver_state() {
+	if ! pidof elpis >/dev/null 2>&1; then
+		echo "not running"
+	elif nslookup localhost 127.0.0.1 >/dev/null 2>&1; then
+		echo "running, answering"
+	else
+		echo "running, not answering yet"
+	fi
+}
+
+uptime_text() {
+	local s
+	s=$(cut -d. -f1 /proc/uptime 2>/dev/null)
+	[ -n "$s" ] || return
+	if [ "$s" -ge 86400 ]; then echo "$((s / 86400)) d $((s % 86400 / 3600)) h"
+	elif [ "$s" -ge 3600 ]; then echo "$((s / 3600)) h $((s % 3600 / 60)) min"
+	else echo "$((s / 60)) min"; fi
+}
+
+# "IF ADDRESS/LEN" for every global address; IF limits it to one interface.
+addresses() {
+	# shellcheck disable=SC2086  # "dev IF" is two words
+	ip addr show $1 2>/dev/null | awk '
+		/^[0-9]+: / { ifc = $2; sub(/:$/, "", ifc); sub(/@.*/, "", ifc) }
+		($1 == "inet" || $1 == "inet6") && ifc != "lo" && $2 !~ /^fe80:/ { print ifc " " $2 }'
+}
+
+status_text() {
+	state_load
+	local slot ver addrs
+	slot=$(cmdline elpis.slot) || slot=builtin
+	ver="Elpis Linux $(release VERSION) (resolver $(release RESOLVER_VERSION))"
+	[ "$slot" = builtin ] || ver="$ver, update $slot"
+	echo "$ver"
+	if persistent; then
+		echo "Settings:  kept on $DATA_DEV"
+	else
+		echo "Settings:  RAM ONLY: ${REASON:-no ELPIS-DATA partition}"
+	fi
+	[ "$SAFE" = 1 ] && echo "           SAFE MODE: saved settings were not loaded"
+	echo "Resolver:  $(resolver_state)"
+	addrs=$(addresses)
+	echo "Addresses: $(echo "$addrs" | head -n 1)"
+	echo "$addrs" | sed -n '2,6s/^/           /p'
+	echo "Listening: $(conf_get listen | tr '\n' ' ')"
+	echo "Up for:    $(uptime_text)"
+}
+
+banner() {
+	state_load
+	if [ "$SAFE" = 1 ]; then
+		echo "Elpis $(release VERSION) -- SAFE MODE: saved settings were not loaded; changes last until reboot"
+	elif persistent; then
+		echo "Elpis $(release VERSION) on $(hostname 2>/dev/null) -- settings are kept on $DATA_DEV"
+	else
+		echo "Elpis $(release VERSION) -- SETTINGS ARE IN RAM ONLY and are lost at reboot"
+	fi
+}
+
+# ---- dialogs -------------------------------------------------------------------
+# dialog draws on fd 4 (the terminal, saved by tui_init) and writes the answer
+# to fd 3, which $(...) captures.
+
+tui_init() {
+	exec 4>&1
+	export DIALOGRC="${DIALOGRC:-/dev/null}"
+	command -v dialog >/dev/null || die "dialog is not installed"
+}
+
+dlg() {
+	dialog --backtitle "$(banner)" --output-fd 3 "$@" 3>&1 1>&4
+}
+
+msg() {
+	dlg --title "${2:-Elpis}" --msgbox "$1" 0 0 >/dev/null
+}
+
+yesno() {
+	dlg --title "${2:-Elpis}" --yesno "$1" 0 0 >/dev/null
+}
+
+ask() {
+	# ask TITLE TEXT [DEFAULT]
+	dlg --title "$1" --inputbox "$2" 0 0 "$3"
+}
+
+ask_password() {
+	dlg --title "$1" --insecure --passwordbox "$2" 0 0
+}
+
+# Run a command, showing its output as it comes, then wait for OK.
+run_shown() {
+	local title="$1"
+	shift
+	{ "$@" 2>&1; rc=$?; echo; echo "(finished with status $rc)"; } |
+		dialog --backtitle "$(banner)" --title "$title" --programbox 20 76 1>&4
+}
+
+show_text() {
+	# show_text TITLE  (text on stdin)
+	local f
+	f=$ELPIS_RUN/show.$$
+	mkdir -p "$ELPIS_RUN"
+	cat > "$f"
+	dialog --backtitle "$(banner)" --title "$1" --textbox "$f" 22 78 1>&4
+	rm -f "$f"
+}
+
+# Run one of the settings commands; show what went wrong, if anything.
+apply_shown() {
+	local out
+	if out=$("$0" "$@" 2>&1); then
+		return 0
+	fi
+	msg "That was not applied:\n\n$out" "Not applied"
+	return 1
+}
+
+# ---- the setup guide ----------------------------------------------------------------
+
+blank_disks() {
+	local b d
+	state_load
+	for b in /sys/block/*; do
+		d=$(basename "$b")
+		case $d in loop* | ram* | zram* | dm-* | md* | sr* | mtdblock* | nbd*) continue ;; esac
+		[ "$d" = "$MEDIA_DISK" ] && continue
+		disk_writable "$d" || continue
+		[ -z "$(disk_mounted_parts "$d")" ] || continue
+		[ -z "$(blkid -c /dev/null -p -o value -s PTTYPE "/dev/$d" 2>/dev/null)" ] || continue
+		[ -z "$(blkid -c /dev/null -p -o value -s TYPE "/dev/$d" 2>/dev/null)" ] || continue
+		cmp -s -n 1048576 "/dev/$d" /dev/zero || continue
+		echo "$d"
+	done
+}
+
+disk_label() {
+	local d="$1" model
+	# Goes through eval when menus are built: only harmless characters.
+	model=$({ tr -cd 'A-Za-z0-9 ._-' < "/sys/block/$d/device/model"; } 2>/dev/null | tr -s ' ' | sed 's/ *$//')
+	echo "$(( $(disk_sectors "$d") / 2048 )) MiB ${model:-disk}"
+}
+
+# shellcheck disable=SC2120  # "$@" is rebuilt from a list, not passed in
+step_storage() {
+	local disks d items choice
+	persistent && return 0
+	state_load
+	disks=$(blank_disks)
+	if [ -z "$disks" ]; then
+		msg "Settings are in RAM only, so everything set up now is lost at the next restart.\n\nWhy: ${REASON:-no ELPIS-DATA partition}.\n\nTo keep settings, write the ISO to a USB stick or disk and start from that, or add an empty disk and choose Storage in the menu." "Storage"
+		return 0
+	fi
+	items=
+	for d in $disks; do items="$items $d \"$(disk_label "$d")\""; done
+	eval "set -- $items"
+	choice=$(dlg --title "Storage" --cancel-label "RAM only" --menu \
+		"Settings are in RAM only.  An empty disk can keep them:\nthe one you choose is formatted as ELPIS-DATA." 0 0 0 "$@") || return 0
+	storage_format_blank "$choice"
+}
+
+storage_format_blank() {
+	local d="$1" typed
+	typed=$(ask "Format /dev/$d" "Everything on /dev/$d ($(disk_label "$d")) is erased.\n\nType $d to go ahead:") || return 1
+	[ "$typed" = "$d" ] || { msg "Not confirmed; /dev/$d was not touched."; return 1; }
+	run_shown "Formatting /dev/$d" elpis-storage format-blank "$d" --yes
+}
+
+step_hostname() {
+	local name
+	while :; do
+		name=$(ask "Name" "This resolver's name (letters, digits, '-'):" "$(cat "$HOSTNAME_FILE" 2>/dev/null)") || return 1
+		apply_shown hostname "$name" && return 0
+	done
+}
+
+# shellcheck disable=SC2120  # "$@" is rebuilt from a list, not passed in
+pick_iface() {
+	local list i items n
+	list=$(interfaces)
+	n=$(echo "$list" | grep -c .)
+	if [ "$n" -le 1 ]; then
+		echo "${list:-eth0}"
+		return 0
+	fi
+	items=
+	for i in $list; do
+		items="$items $i \"$(cat "/sys/class/net/$i/address" "/sys/class/net/$i/operstate" 2>/dev/null | tr -cd 'A-Za-z0-9:\n' | tr '\n' ' ')\""
+	done
+	eval "set -- $items"
+	dlg --title "Network" --default-item "$(default_iface)" --menu "Which network port?" 0 0 0 "$@"
+}
+
+step_network() {
+	local ifc v4 a4 g4 v6 a6 g6 args
+	ifc=$(pick_iface) || return 1
+	eval "$(net_read "$ifc")"
+	a4=$V4ADDR; [ -n "$a4" ] && a4=$a4/$(mask_to_len "$V4MASK")
+	a6=$V6ADDR; [ -n "$a6" ] && a6=$a6/$V6LEN
+	g4=$V4GW g6=$V6GW
+
+	v4=$(dlg --title "Network: IPv4" --default-item "$V4" --menu \
+		"IPv4 on $ifc.  A resolver is easiest to point clients at with a fixed address." 0 0 0 \
+		dhcp "Automatic (DHCP)" static "Fixed address") || return 1
+	args="--iface $ifc --ipv4 $v4"
+	if [ "$v4" = static ]; then
+		while :; do
+			a4=$(ask "Network: IPv4" "Address and prefix length, like 192.168.1.53/24:" "$a4") || return 1
+			ipcheck prefix 4 "$a4" && break
+			msg "'$a4' is not an IPv4 address with a prefix length."
+		done
+		while :; do
+			g4=$(ask "Network: IPv4" "Gateway (empty for none):" "$g4") || return 1
+			[ -z "$g4" ] || ipcheck addr 4 "$g4" && break
+			msg "'$g4' is not an IPv4 address."
+		done
+		args="--iface $ifc --ipv4 $a4${g4:+ --gw4 $g4}"
+	fi
+
+	v6=$(dlg --title "Network: IPv6" --default-item "$V6" --menu "IPv6 on $ifc:" 0 0 0 \
+		auto "Automatic (router advertisements)" static "Fixed address") || return 1
+	if [ "$v6" = static ]; then
+		while :; do
+			a6=$(ask "Network: IPv6" "Address and prefix length, like 2001:db8::53/64:" "$a6") || return 1
+			ipcheck prefix 6 "$a6" && break
+			msg "'$a6' is not an IPv6 address with a prefix length."
+		done
+		while :; do
+			g6=$(ask "Network: IPv6" "Gateway (empty for the one routers advertise):" "$g6") || return 1
+			[ -z "$g6" ] || ipcheck addr 6 "$g6" && break
+			msg "'$g6' is not an IPv6 address."
+		done
+		args="$args --ipv6 $a6${g6:+ --gw6 $g6}"
+	else
+		args="$args --ipv6 auto"
+	fi
+
+	# shellcheck disable=SC2086
+	apply_shown network $args --trial 60 || return 1
+	sleep 3
+	if dlg --title "Keep these settings?" --timeout 60 --yes-label "Keep" --no-label "Undo" --yesno \
+		"The new settings are in use:\n\n$(addresses "dev $ifc" | awk '{ print "  " $2 }')\n\nKeep them?  Without an answer they are undone in 60 seconds." 0 0 >/dev/null; then
+		"$0" network --keep >/dev/null 2>&1
+	else
+		"$0" network --revert >/dev/null 2>&1
+		msg "The previous network settings are back." "Network"
+		return 1
+	fi
+}
+
+step_access() {
+	local choice nets n bad line
+	choice=$(dlg --title "Who may use this resolver" --menu \
+		"Queries from anywhere else are refused.  An open resolver gets abused, so only widen this behind a firewall." 0 0 0 \
+		private "Private and local networks (the default)" \
+		these "Only the networks I list") || return 1
+	if [ "$choice" = private ]; then
+		set --
+		while IFS= read -r line; do
+			[ -n "$line" ] && set -- "$@" "$line"
+		done <<-EOF
+		$(conf_get access-control "$SHIPPED_CONF")
+		EOF
+		apply_shown set access-control "$@"
+		return
+	fi
+	nets=$(conf_get access-control | awk '$2 == "allow" && $1 != "127.0.0.0/8" && $1 != "::1/128" { printf "%s ", $1 }')
+	while :; do
+		nets=$(ask "Who may use this resolver" "Networks, separated by spaces, like 192.168.1.0/24 2001:db8::/48.\nThis machine itself is always allowed." "$nets") || return 1
+		bad=
+		for n in $nets; do
+			ipcheck prefix any "$n" || { bad=$n; break; }
+		done
+		[ -z "$bad" ] || { msg "'$bad' is not a network like 192.168.1.0/24."; continue; }
+		case " $nets " in *" 0.0.0.0/0 "* | *" ::/0 "*)
+			yesno "That makes this an open resolver: anyone who can reach it can use it, and open resolvers get abused for attacks.\n\nOnly do this behind a firewall.  Go ahead?" || continue ;;
+		esac
+		set -- "127.0.0.0/8 allow" "::1/128 allow"
+		for n in $nets; do set -- "$@" "$n allow"; done
+		apply_shown set access-control "$@" && return 0
+	done
+}
+
+step_webgui() {
+	local p1 p2
+	if ! yesno "Turn on the read-only status page?\n\nIt shows the cache, response times, the busiest names and clients, and the log.  It listens on 127.0.0.1:8082 only: reach it with\n\n  ssh -L 8082:127.0.0.1:8082 root@this-resolver" "Status page"; then
+		apply_shown set webgui no
+		return 0
+	fi
+	while :; do
+		p1=$(ask_password "Status page" "A password for the page (user: admin), 8 characters or more:") || return 1
+		p2=$(ask_password "Status page" "The same password again:") || return 1
+		[ "$p1" = "$p2" ] || { msg "The two did not match."; continue; }
+		[ ${#p1} -ge 8 ] || { msg "Use at least 8 characters."; continue; }
+		break
+	done
+	printf '%s\n' "$p1" | "$0" webgui-password >/dev/null 2>&1 || { msg "The password could not be set."; return 1; }
+	apply_shown set webgui yes
+}
+
+step_ntp() {
+	local list s bad
+	list=$(ntp_servers)
+	while :; do
+		list=$(ask "Time" "NTP servers, by address, separated by spaces.  DNSSEC needs the right time, and names cannot be looked up before the resolver runs." "$list") || return 1
+		bad=
+		for s in $list; do ipcheck addr any "$s" || { bad=$s; break; }; done
+		[ -z "$bad" ] || { msg "'$bad' is not an address."; continue; }
+		[ -n "$list" ] || { msg "Give at least one server."; continue; }
+		# shellcheck disable=SC2086
+		apply_shown ntp $list && return 0
+	done
+}
+
+step_root_password() {
+	local p1 p2
+	if root_has_password; then
+		yesno "Change the password for the console menu and SSH?" "Password" || return 0
+	else
+		yesno "Anyone at this screen can change these settings.  Protect the menu (and SSH, if you turn it on) with a root password?" "Password" || return 0
+	fi
+	while :; do
+		p1=$(ask_password "Password" "New root password, 8 characters or more:") || return 0
+		p2=$(ask_password "Password" "The same password again:") || return 0
+		[ "$p1" = "$p2" ] || { msg "The two did not match."; continue; }
+		[ ${#p1} -ge 8 ] || { msg "Use at least 8 characters."; continue; }
+		printf '%s\n' "$p1" | "$0" root-password >/dev/null 2>&1 && return 0
+		msg "The password could not be set."
+	done
+}
+
+wizard() {
+	tui_init
+	dlg --title "Elpis setup" --yes-label "Start" --no-label "Skip" --yesno \
+		"$(status_text)\n\nThis guide sets the name, the network, who may use the resolver, the status page, the clock and a password.  Each step is kept as soon as it is done.\n\nEverything here is also in the menu later." 0 0 >/dev/null ||
+		{ setup_done; return 0; }
+	step_storage
+	step_hostname || :
+	step_network || :
+	step_access || :
+	step_webgui || :
+	step_ntp || :
+	step_root_password || :
+	setup_done
+	msg "Setup is done.\n\n$(status_text)" "Elpis setup"
+}
+
+# ---- the menu ----------------------------------------------------------------
+
+menu_resolver() {
+	local c v
+	while :; do
+		c=$(dlg --title "Resolver" --cancel-label "Back" --menu "Each change is checked by the resolver first, then restarts it: its cache starts empty." 0 0 0 \
+			access "Who may use it: $(conf_get access-control | wc -l) rule(s)" \
+			listen "Listen on: $(conf_get listen | tr '\n' ' ')" \
+			dnssec "DNSSEC validation: $(conf_get dnssec)" \
+			dot "DNS over TLS to authoritative servers: $(conf_get authoritative-dot)" \
+			ecs "EDNS Client Subnet: $(conf_get ecs)" \
+			identity "Identity probe ($IDENTITY_NAME): $(conf_get identity)" \
+			view "Show elpis.conf") || return 0
+		case $c in
+		access) step_access ;;
+		listen)
+			v=$(ask "Listen on" "ADDRESS@PORT, separated by spaces.  0.0.0.0@53 [::]@53 is every address." "$(conf_get listen | tr '\n' ' ')") || continue
+			# shellcheck disable=SC2086
+			apply_shown set listen $v
+			;;
+		dnssec) v=$(dlg --title "DNSSEC" --default-item "$(conf_get dnssec)" --menu "Validate DNSSEC?  Leave it on." 0 0 0 yes "Validate (refuse forged answers)" no "Do not validate") && apply_shown set dnssec "$v" ;;
+		dot) v=$(dlg --title "DNS over TLS" --default-item "$(conf_get authoritative-dot)" --menu "Encrypt queries to servers that offer DoT?" 0 0 0 opportunistic "Where offered" no "Never") && apply_shown set authoritative-dot "$v" ;;
+		ecs) v=$(dlg --title "EDNS Client Subnet" --default-item "$(conf_get ecs)" --menu "Send part of the client's address to authorities, so CDNs answer for where clients are?" 0 0 0 no "No (more private)" yes "Yes") && apply_shown set ecs "$v" ;;
+		identity) v=$(dlg --title "Identity probe" --default-item "$(conf_get identity)" --menu "Answer TXT $IDENTITY_NAME with what is running?" 0 0 0 yes "Yes" no "No") && apply_shown set identity "$v" ;;
+		view) show_text "elpis.conf" < "$CONF" ;;
+		esac
+	done
+}
+
+menu_remote() {
+	local c k
+	while :; do
+		c=$(dlg --title "Remote access" --cancel-label "Back" --menu "SSH is $(ssh_enabled && echo on || echo off)." 0 0 0 \
+			ssh "Turn SSH $(ssh_enabled && echo off || echo on)" \
+			key "Add an SSH public key for root" \
+			clear "Remove every SSH key" \
+			password "Set the root password") || return 0
+		case $c in
+		ssh) if ssh_enabled; then apply_shown ssh off; else apply_shown ssh on; fi ;;
+		key) k=$(ask "SSH key" "Paste a public key (ssh-ed25519 AAAA... comment):") && [ -n "$k" ] && apply_shown ssh-key add "$k" ;;
+		clear) yesno "Remove every SSH key for root?" && apply_shown ssh-key clear ;;
+		password) step_root_password ;;
+		esac
+	done
+}
+
+menu_licence() {
+	local t
+	t=$(ask "Licence" "Paste the licence token (elpis1....), or leave empty to remove it.\nThe resolver checks it when it starts; the identity probe then says whether it verified." "$(conf_get licence)") || return 0
+	if [ -n "$t" ]; then apply_shown set licence "$t"; else apply_shown set licence; fi || return 0
+	sleep 4
+	nslookup -type=TXT "$IDENTITY_NAME" 127.0.0.1 2>&1 | show_text "What the resolver says now"
+}
+
+menu_diagnostics() {
+	local c n
+	while :; do
+		c=$(dlg --title "Diagnostics" --cancel-label "Back" --menu "" 0 0 0 \
+			lookup "Look up a name" \
+			log "Show the log" \
+			ping "Ping an address or name" \
+			probe "Ask the identity probe" \
+			storage "Storage and updates") || return 0
+		case $c in
+		lookup) n=$(ask "Look up" "Name:" "example.com") && nslookup "$n" 127.0.0.1 2>&1 | show_text "$n" ;;
+		log) logread 2>&1 | tail -n 300 | show_text "Log" ;;
+		ping) n=$(ask "Ping" "Address or name:" "9.9.9.9") && run_shown "ping $n" ping -c 4 "$n" ;;
+		probe) nslookup -type=TXT "$IDENTITY_NAME" 127.0.0.1 2>&1 | show_text "Identity probe" ;;
+		storage) { elpis-storage status; echo; elpis-update --status; } 2>&1 | show_text "Storage and updates" ;;
+		esac
+	done
+}
+
+menu_updates() {
+	local c src
+	while :; do
+		c=$(dlg --title "Updates" --cancel-label "Back" --menu "$(elpis-update --status 2>&1 | head -n 4)" 0 0 0 \
+			url "Install an update from a URL" \
+			file "Install an update from a file" \
+			revert "Go back to the version on the medium" \
+			prune "Delete updates that will not start") || return 0
+		case $c in
+		url | file)
+			if [ "$c" = url ]; then
+				src=$(ask "Update" "URL of the ISO (its .minisig signature is fetched beside it):" "https://") || continue
+			else
+				src=$(ask "Update" "Path of the ISO (mount a USB stick from the shell first):" "/mnt/") || continue
+			fi
+			run_shown "Installing $src" elpis-update --from-iso "$src"
+			yesno "Restart now to start the update?" "Update" && sys reboot
+			;;
+		revert) yesno "Start the version built in to the medium from the next restart?" && run_shown "Going back" elpis-update --revert ;;
+		prune) run_shown "Cleaning up" elpis-update --prune ;;
+		esac
+	done
+}
+
+# shellcheck disable=SC2120  # "$@" is rebuilt from a list, not passed in
+menu_copy() {
+	local items d t keepc
+	state_load
+	items=
+	for d in $(elpis-copy-to-disk --list 2>/dev/null | awk 'NR > 1 && $1 !~ /^sr/ && $0 !~ /boot-medium|mounted|read-only/ { print $1 }'); do
+		items="$items $d \"$(disk_label "$d")\""
+	done
+	[ -n "$items" ] || { msg "There is no other disk to copy to." "Copy to disk"; return 0; }
+	eval "set -- $items"
+	t=$(dlg --title "Copy to disk" --menu "Write this Elpis to which disk?  Everything on it is erased." 0 0 0 "$@") || return 0
+	keepc=
+	yesno "Carry over the settings (and the running update, if any)?" "Copy to disk" && keepc=--keep-config
+	d=$(ask "Copy to /dev/$t" "Everything on /dev/$t ($(disk_label "$t")) is erased.\n\nType $t to go ahead:") || return 0
+	[ "$d" = "$t" ] || { msg "Not confirmed; /dev/$t was not touched."; return 0; }
+	run_shown "Copying to /dev/$t" elpis-copy-to-disk --disk "$t" $keepc --yes
+}
+
+# shellcheck disable=SC2120  # "$@" is rebuilt from a list, not passed in
+menu_storage() {
+	local c d disks items
+	while :; do
+		c=$(dlg --title "Storage" --cancel-label "Back" --menu "$(elpis-storage status 2>&1)" 0 0 0 \
+			blank "Keep settings on an empty disk" \
+			copy "Copy this system to another disk" \
+			reset "Reset settings (keep updates)" \
+			factory "Factory reset: erase settings and updates") || return 0
+		case $c in
+		blank)
+			persistent && { msg "Settings are already kept on $DATA_DEV."; continue; }
+			disks=$(blank_disks)
+			[ -n "$disks" ] || { msg "There is no empty disk.  Only a disk with no partitions and nothing written at its start is used."; continue; }
+			items=
+			for d in $disks; do items="$items $d \"$(disk_label "$d")\""; done
+			eval "set -- $items"
+			d=$(dlg --title "Storage" --menu "Format which disk as ELPIS-DATA?" 0 0 0 "$@") && storage_format_blank "$d"
+			;;
+		copy) menu_copy ;;
+		reset)
+			persistent || { msg "Settings are in RAM only: restart and they are gone."; continue; }
+			yesno "Delete every saved setting and restart with the defaults?  Installed updates stay." "Reset settings" &&
+				yesno "Sure?  This cannot be undone." "Reset settings" && {
+					rm -rf "${CONFIG_STORE:?}"/* "$SETUP_DONE"
+					sync
+					sys reboot
+				}
+			;;
+		factory)
+			persistent || { msg "There is no ELPIS-DATA to erase: settings are in RAM only."; continue; }
+			yesno "Erase every setting and every installed update, then restart with the version on the medium?" "Factory reset" &&
+				yesno "Sure?  This cannot be undone." "Factory reset" && {
+					elpis-storage request-reset >/dev/null 2>&1
+					sys reboot
+				}
+			;;
+		esac
+	done
+}
+
+menu() {
+	tui_init
+	local c timeout_opt=''
+	[ "$1" = console ] && timeout_opt="--timeout 60"
+	while :; do
+		# shellcheck disable=SC2086
+		c=$(dlg $timeout_opt --title "Elpis" --cancel-label "$([ "$1" = console ] && echo Refresh || echo Exit)" \
+			--menu "$(status_text)" 0 0 0 \
+			network "Network: address, gateway, name" \
+			resolver "Resolver: who may use it, DNSSEC, DoT" \
+			webgui "Status page" \
+			time "Time: NTP servers" \
+			remote "Remote access: SSH, password" \
+			licence "Licence" \
+			diag "Diagnostics: look up, log, ping" \
+			updates "Updates" \
+			storage "Storage: disks, copy, reset" \
+			setup "Run the setup guide again" \
+			reboot "Restart" \
+			poweroff "Shut down" \
+			shell "Shell") || { [ "$1" = console ] && continue; break; }
+		case $c in
+		network) step_network; step_hostname ;;
+		resolver) menu_resolver ;;
+		webgui) step_webgui ;;
+		time) step_ntp ;;
+		remote) menu_remote ;;
+		licence) menu_licence ;;
+		diag) menu_diagnostics ;;
+		updates) menu_updates ;;
+		storage) menu_storage ;;
+		setup) wizard ;;
+		reboot) yesno "Restart now?" && sys reboot ;;
+		poweroff) yesno "Shut down now?" && sys poweroff ;;
+		shell)
+			clear
+			echo "Type 'exit' to go back to the menu."
+			if [ "$1" = console ]; then /bin/sh -l; else return 0; fi
+			;;
+		esac
+	done
+	clear
+}
+
+# On the screen: a password prompt first when root has one.
+console() {
+	tui_init
+	local pw
+	while root_has_password; do
+		pw=$(dlg --title "Elpis" --insecure --cancel-label "Refresh" --timeout 300 --passwordbox \
+			"$(status_text)\n\nRoot password, to change settings:" 0 0) || continue
+		printf '%s\n' "$pw" | root_password_ok && break
+		msg "That is not the root password." "Elpis"
+	done
+	needs_setup && wizard
+	menu console
+}
+
+# ---- commands ------------------------------------------------------------------
+
+case $1 in
+"" | --menu) menu ;;
+--console) console ;;
+--wizard) wizard ;;
+-h | --help) sed -n '3,33s/^# \{0,1\}//p' "$0" ;;
+status) status_text ;;
+get) [ -n "$2" ] || die "get KEY"; conf_get "$2" ;;
+set) shift; [ -n "$1" ] || die "set KEY [VALUE...]"; conf_apply "$@" ;;
+webgui-password) cmd_webgui_password ;;
+hostname) cmd_hostname "$2" ;;
+network) shift; cmd_network "$@" ;;
+ntp) shift; cmd_ntp "$@" ;;
+root-password) cmd_root_password ;;
+ssh) cmd_ssh "$2" ;;
+ssh-key) shift; cmd_ssh_key "$@" ;;
+needs-setup) needs_setup ;;
+*) die "unknown command '$1' (elpis-config --help)" ;;
+esac

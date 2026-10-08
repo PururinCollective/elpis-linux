@@ -9,6 +9,7 @@
 # after the third, goes back to the version that worked.
 
 PROG=elpis-health
+# shellcheck source=lib.sh
 . /usr/libexec/elpis/lib.sh
 
 HEALTH_TIMEOUT=${HEALTH_TIMEOUT:-180}

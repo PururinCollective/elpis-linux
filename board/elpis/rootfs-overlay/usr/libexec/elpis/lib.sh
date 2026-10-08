@@ -1,4 +1,5 @@
 # Shared by the elpis-* commands.  Sourced, never run; set PROG first.
+# shellcheck shell=sh disable=SC2034  # the variables are for the commands
 #
 # The ISO boots with the whole system in RAM.  What survives a reboot lives
 # on a partition labelled ELPIS-DATA, mounted at /data:
@@ -45,6 +46,7 @@ die() {
 # The value of a kernel command-line option, or 1 for a bare flag.
 cmdline() {
 	local w
+	# shellcheck disable=SC2013  # the command line is words
 	for w in $(cat /proc/cmdline); do
 		case $w in
 		"$1") echo 1; return 0 ;;
@@ -63,6 +65,7 @@ release() {
 
 state_load() {
 	MODE=ram
+	# shellcheck disable=SC1090
 	[ -r "$ELPIS_STATE" ] && . "$ELPIS_STATE"
 	return 0
 }
@@ -89,7 +92,7 @@ persistent() {
 
 # sdb1 -> sdb, nvme0n1p3 -> nvme0n1, sdb -> sdb
 disk_of() {
-	local n=${1#/dev/}
+	local n="${1#/dev/}"
 	if [ -e "/sys/class/block/$n/partition" ]; then
 		basename "$(readlink -f "/sys/class/block/$n/..")"
 	else
@@ -121,7 +124,7 @@ disk_sectors() {
 
 # Partitions of the disk that are mounted (or swapped on), one per line.
 disk_mounted_parts() {
-	local d=$1
+	local d="$1"
 	awk -v d="/dev/$d" 'index($1, d) == 1 { print $1 }' /proc/mounts /proc/swaps 2>/dev/null |
 		sort -u
 }
@@ -147,7 +150,7 @@ part_extent() {
 # Anything else -- another partition, a GPT, a different ISO -- means the
 # disk is somebody else's, and Elpis leaves it alone.
 layout_ok() {
-	local uuid=$1 d=$2 dump n p3
+	local uuid="$1" d="$2" dump n p3
 	dump=$(sfdisk -d "/dev/$d" 2>/dev/null) || return 1
 	echo "$dump" | grep -q '^label: dos$' || return 1
 	n=$(echo "$dump" | grep -c '^/dev/')
@@ -186,7 +189,7 @@ mkfs_data() {
 # Add ELPIS-DATA as partition 3 of a disk whose layout_ok holds.
 # Returns 0 when made, 2 when the disk is too small, 1 on failure.
 create_data_part() {
-	local d=$1 total p2 end2 start p3
+	local d="$1" total p2 end2 start p3
 	total=$(disk_sectors "$d")
 	p2=$(part_extent "$d" 2)
 	[ -n "$p2" ] || return 1
@@ -228,7 +231,7 @@ grubenv_get() {
 
 # grubenv_set KEY=VALUE ...  (an empty VALUE removes KEY)
 grubenv_set() {
-	local tmp=$GRUBENV.new size kv
+	local tmp="$GRUBENV.new" size kv
 	{
 		echo '# GRUB Environment Block'
 		if [ -f "$GRUBENV" ]; then
@@ -267,7 +270,7 @@ keep_paths() {
 # /data/config), replacing what was there; a PATH that no longer exists is
 # removed from the store.
 store_path() {
-	local p=$1 root=${2:-$CONFIG_STORE} dst tmp
+	local p="$1" root="${2:-$CONFIG_STORE}" dst tmp
 	dst=$root$p
 	tmp=$dst.saving
 	rm -rf "$tmp"
@@ -288,7 +291,7 @@ store_path() {
 # Put the stored copy of PATH back.  /etc/shadow is merged line by line, so an
 # account the image adds later is not lost to an old saved copy.
 restore_path() {
-	local p=$1 src=$CONFIG_STORE$1
+	local p="$1" src="$CONFIG_STORE$1"
 	[ -e "$src" ] || return 0
 	case $p in
 	/etc/shadow)

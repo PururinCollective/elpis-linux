@@ -1,0 +1,43 @@
+#!/bin/sh
+#
+# SSH (dropbear), started only when elpis-config has turned it on
+# (/etc/elpis/ssh.conf).  Host keys are kept in /etc/dropbear, which
+# elpis-save keeps, so they stay the same from one start to the next.
+# Logins with an empty password are refused.
+
+CONF=/etc/elpis/ssh.conf
+PIDFILE=/var/run/dropbear.pid
+
+# shellcheck disable=SC1091
+[ -r /etc/default/dropbear ] && . /etc/default/dropbear
+
+enabled() {
+	grep -q '^SSH=yes' "$CONF" 2>/dev/null
+}
+
+start() {
+	enabled || return 0
+	[ -L /etc/dropbear ] && rm -f /etc/dropbear
+	mkdir -p /etc/dropbear
+	printf 'Starting SSH: '
+	umask 077
+	# shellcheck disable=SC2086
+	if start-stop-daemon -S -q -p "$PIDFILE" --exec /usr/sbin/dropbear -- -R $DROPBEAR_ARGS; then
+		echo OK
+	else
+		echo FAIL
+		return 1
+	fi
+}
+
+stop() {
+	start-stop-daemon -K -q -p "$PIDFILE" 2>/dev/null
+	return 0
+}
+
+case "$1" in
+start) start ;;
+stop) stop ;;
+restart | reload) stop; sleep 1; start ;;
+*) echo "Usage: $0 {start|stop|restart}"; exit 1 ;;
+esac

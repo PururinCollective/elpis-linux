@@ -16,6 +16,12 @@ Scenarios (all by default, in this order):
     copy         elpis-copy-to-disk from a CD start, then start from the copy
     update       signed update from a newer ISO, then a broken one that GRUB
                  falls back from (needs --update-iso and --key)
+    config       elpis-config: the setup guide driven over the serial console,
+                 kept across a restart; the console password; an update and a
+                 factory reset through the menu; a network change undone when
+                 not kept; SSH with a key (needs --update-iso and --key)
+    config-ram   the setup guide from a CD with a blank disk: it offers the
+                 disk first and keeps settings there
 
 Needs qemu-system-x86_64, KVM, OVMF for "uefi", dig, and sfdisk.  Work files go
 to tests/work/.  Every serial console is logged there as <scenario>-*.log.
@@ -68,9 +74,12 @@ def free_port():
 
 
 class VM:
-    def __init__(self, name, cdrom=None, disks=(), uefi=False, boot="c", mem=1024):
+    def __init__(self, name, cdrom=None, disks=(), uefi=False, boot="c", mem=1024, fwd_to=(), ssh_to=None):
         self.name = name
         self.dns_port = free_port()
+        # dns_ports[addr]: a host port forwarded to port 53 of a fixed guest address
+        self.dns_ports = {a: free_port() for a in fwd_to}
+        self.ssh_port = free_port() if ssh_to else None
         self.sock = os.path.join(tempfile.mkdtemp(prefix="elpis-"), "serial")
         self.log = open(os.path.join(WORK, f"{CURRENT}-{name}.log"), "wb")
         self.buf = b""
@@ -82,7 +91,10 @@ class VM:
                "-serial", "chardev:s0", "-monitor", "none",
                "-netdev", "user,id=n0,"
                f"hostfwd=udp:127.0.0.1:{self.dns_port}-:53,"
-               f"hostfwd=tcp:127.0.0.1:{self.dns_port}-:53",
+               f"hostfwd=tcp:127.0.0.1:{self.dns_port}-:53"
+               + "".join(f",hostfwd=udp:127.0.0.1:{p}-{a}:53,hostfwd=tcp:127.0.0.1:{p}-{a}:53"
+                         for a, p in self.dns_ports.items())
+               + (f",hostfwd=tcp:127.0.0.1:{self.ssh_port}-{ssh_to}:22" if ssh_to else ""),
                "-device", "virtio-net-pci,netdev=n0",
                "-object", "rng-random,filename=/dev/urandom,id=rng0",
                "-device", "virtio-rng-pci,rng=rng0"]
@@ -140,6 +152,30 @@ class VM:
             time.sleep(0.1)
         raise Failure(f"timed out waiting for {pattern!r}")
 
+    def expect_screen(self, words, timeout=60):
+        """Wait for WORDS on a curses screen: escape sequences and runs of
+        spaces between them do not matter.  Consumes everything so far."""
+        # Between words: spaces, and where dialog wrapped the line, the box's
+        # borders ("x" in the line-drawing set) and its edge.
+        rx = re.compile(r"(?:\s+x)*\s+".join(re.escape(w) for w in words.split()).encode())
+        end = time.time() + timeout
+        while time.time() < end:
+            with self.lock:
+                raw = self.buf[self.pos:]
+                clean = re.sub(rb"\x1b\[[0-9;?]*[A-Za-z]|\x1b[()][A-Z0-9]|\x0f|\x0e", b" ", raw)
+                if rx.search(clean):
+                    self.pos = len(self.buf)
+                    return True
+            if self.proc.poll() is not None:
+                raise Failure(f"VM exited while waiting for {words!r}")
+            time.sleep(0.2)
+        raise Failure(f"timed out waiting for the screen to show {words!r}")
+
+    def keys(self, *seq, gap=0.3):
+        for k in seq:
+            self.send(k)
+            time.sleep(gap)
+
     def send(self, text):
         self.conn.sendall(text.encode() if isinstance(text, str) else text)
 
@@ -156,9 +192,12 @@ class VM:
             time.sleep(0.5)
             self.send("\x1b[B" * submenu_entry + "\r")
 
-    def login(self, timeout=180):
+    def login(self, timeout=180, password=None):
         self.expect(r"login: ", timeout)
         self.send("root\n")
+        if password is not None:
+            self.expect(r"Password: ", 30)
+            self.send(password + "\n")
         time.sleep(1)
         # Split so the echoed command itself does not look like the prompt.
         self.send("export PS1='__ELPIS_''PROMPT__# '; stty -echo cols 250\n")
@@ -513,9 +552,220 @@ def t_update(a):
         httpd.shutdown()
 
 
+
+ENTER = "\r"     # menus are driven by the first letter of an item, not arrows
+CLEAR = "\x15" + "\x08" * 80      # ^U, then backspaces for good measure
+
+
+def serve(files):
+    """Serve FILES over HTTP to the guest; returns (server, base URL)."""
+    root = os.path.join(WORK, "http")
+    shutil.rmtree(root, ignore_errors=True)
+    os.makedirs(root)
+    for f in files:
+        shutil.copy(f, root)
+    port = free_port()
+    httpd = http.server.ThreadingHTTPServer(("127.0.0.1", port),
+                                            lambda *x, **k: Quiet(*x, directory=root, **k))
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    return httpd, f"http://10.0.2.2:{port}"
+
+
+def back_to_shell(vm):
+    vm.send("stty sane -echo cols 250; clear\n")
+    vm.expect(re.escape(PROMPT), 30)
+
+
+def release_id(vm):
+    return vm.out(". /etc/elpis-release; echo $VERSION-$BUILD_ID")
+
+
+def t_config(a):
+    if not (a.update_iso and a.key):
+        note("needs --update-iso and --key: skipped")
+        return
+    httpd, url = serve([a.update_iso, a.update_iso + ".minisig"])
+    upd = os.path.basename(a.update_iso)
+    disk = fresh_disk(os.path.join(WORK, "config.raw"), a.iso)
+    vm = VM("setup", disks=[disk], fwd_to=["10.0.2.50"], ssh_to="10.0.2.50")
+    new_port = vm.dns_ports["10.0.2.50"]
+    try:
+        vm.grub(0)
+        vm.login()
+        check(vm.run("elpis-config needs-setup")[0] == 0, "a fresh start needs setting up")
+        check(vm.run("ps | grep -q '[e]lpis-config --console'")[0] == 0, "the screen (tty1) runs elpis-config --console")
+        base = release_id(vm)
+
+        # The setup guide, driven over the serial console.
+        vm.send("stty sane echo rows 24 cols 80; TERM=vt100 elpis-config --wizard; echo __WIZ__$?__\n")
+        vm.expect_screen("This guide sets"); vm.keys(ENTER)
+        vm.expect_screen("resolver's name"); vm.keys(CLEAR, "resolver-1", ENTER)
+        vm.expect_screen("easiest to point"); vm.keys("s", ENTER)
+        vm.expect_screen("like 192.168.1.53/24"); vm.keys(CLEAR, "10.0.2.50/24", ENTER)
+        vm.expect_screen("Gateway (empty for none)"); vm.keys(CLEAR, "10.0.2.2", ENTER)
+        vm.expect_screen("Automatic (router advertisements)"); vm.keys(ENTER)
+        vm.expect_screen("Keep them?", 90); vm.keys(ENTER)
+        vm.expect_screen("Queries from anywhere", 60); vm.keys("t", ENTER)
+        vm.expect_screen("2001:db8::/48"); vm.keys(CLEAR, "10.0.2.0/24 192.168.0.0/16", ENTER)
+        vm.expect_screen("read-only status page", 60); vm.keys(ENTER)
+        vm.expect_screen("(user: admin)"); vm.keys("statuspass1", ENTER)
+        vm.expect_screen("same password again"); vm.keys("statuspass1", ENTER)
+        vm.expect_screen("NTP servers, by address", 60); vm.keys(ENTER)
+        vm.expect_screen("Protect the menu", 60); vm.keys(ENTER)
+        vm.expect_screen("New root password"); vm.keys("rootpass123", ENTER)
+        vm.expect_screen("same password again"); vm.keys("rootpass123", ENTER)
+        vm.expect_screen("Setup is done", 60); vm.keys(ENTER)
+        m = vm.expect(r"__WIZ__(\d+)__", 30)
+        check(m.group(1) == b"0", "the setup guide runs to the end over a serial terminal")
+        back_to_shell(vm)
+
+        check(vm.out("hostname") == "resolver-1", "hostname set")
+        check("10.0.2.50/24" in vm.out("ip addr show eth0"), "the fixed address is in use")
+        check("10.0.2.50" in vm.out("cat /data/config/etc/network/interfaces"), "and was kept once confirmed")
+        acl = vm.out("elpis-config get access-control")
+        check("10.0.2.0/24 allow" in acl and "127.0.0.0/8 allow" in acl and "10.0.0.0/8" not in acl,
+              "access list replaced, loopback kept")
+        check(vm.out("elpis-config get webgui") == "yes" and
+              vm.out("elpis-config get webgui-password").startswith("$pbkdf2-sha256$"),
+              "status page on, password stored as a hash")
+        check(vm.out("awk -F: '$1 == \"root\" { print substr($2, 1, 3) }' /etc/shadow") == "$6$", "root password set")
+        check(vm.run("elpis-config needs-setup")[0] != 0, "the guide is marked done")
+        r = subprocess.run(["dig", "@127.0.0.1", "-p", str(new_port), "example.com", "+dnssec", "+time=5", "+tries=1"],
+                           capture_output=True, text=True)
+        for _ in range(20):
+            if "status: NOERROR" in r.stdout:
+                break
+            time.sleep(3)
+            r = subprocess.run(["dig", "@127.0.0.1", "-p", str(new_port), "example.com", "+dnssec", "+time=5", "+tries=1"],
+                               capture_output=True, text=True)
+        check(re.search(r"flags:[^;]* ad[ ;]", r.stdout) is not None, "the resolver answers on 10.0.2.50, with DNSSEC")
+
+        st, _ = vm.run("elpis-config network --ipv4 10.0.2.60/24 --gw4 10.0.2.2 --trial 8")
+        check(st == 0 and "10.0.2.60/24" in vm.out("ip addr show eth0"), "a network change on trial is applied")
+        time.sleep(16)
+        ip = vm.out("ip addr show eth0")
+        check("10.0.2.60" not in ip and "10.0.2.50/24" in ip and
+              "10.0.2.50" in vm.out("cat /etc/network/interfaces"), "and undone when nobody keeps it")
+
+        key = os.path.join(WORK, "sshkey")
+        for f in (key, key + ".pub"):
+            if os.path.exists(f):
+                os.remove(f)
+        subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", key], check=True)
+        pub = open(key + ".pub").read().strip()
+        check(vm.run(f"elpis-config ssh-key add {pub}")[0] == 0 and vm.run("elpis-config ssh on")[0] == 0,
+              "SSH on, with a key for root")
+        host_key = vm.out("md5sum /etc/dropbear/dropbear_ed25519_host_key | cut -c1-32")
+        check(vm.run("test -f /data/config/etc/dropbear/dropbear_ed25519_host_key")[0] == 0, "the host key is kept")
+
+        def ssh_hostname():
+            r = subprocess.run(["ssh", "-i", key, "-p", str(vm.ssh_port), "-o", "StrictHostKeyChecking=no",
+                                "-o", "UserKnownHostsFile=/dev/null", "-o", "BatchMode=yes",
+                                "-o", "ConnectTimeout=10", "root@127.0.0.1", "hostname"],
+                               capture_output=True, text=True, timeout=60)
+            return r.stdout.strip()
+        check(ssh_hostname() == "resolver-1", "root logs in over SSH with the key")
+
+        vm.reboot()
+        vm.grub(0)
+        vm.login(password="rootpass123")
+        check(True, "after a restart, root logs in with the new password")
+        check(vm.out("hostname") == "resolver-1" and "10.0.2.50/24" in vm.out("ip addr show eth0"),
+              "the name and the fixed address are back")
+        check(vm.out("elpis-config get webgui") == "yes", "so are the resolver settings")
+        check(vm.run("elpis-config needs-setup")[0] != 0, "and the guide does not run again")
+        check(vm.out("md5sum /etc/dropbear/dropbear_ed25519_host_key | cut -c1-32") == host_key,
+              "SSH keeps its host key across the restart")
+        check(ssh_hostname() == "resolver-1", "and still lets the key in")
+
+        # The screen's password gate, then the menu, run on the serial port.
+        vm.send("stty sane echo rows 24 cols 80; TERM=vt100 elpis-config --console; echo __CON__$?__\n")
+        vm.expect_screen("Root password, to change settings"); vm.keys("wrongpass1", ENTER)
+        vm.expect_screen("not the root password"); vm.keys(ENTER)
+        vm.expect_screen("Root password, to change settings"); vm.keys("rootpass123", ENTER)
+        vm.expect_screen("Run the setup guide again", 30)
+        check(True, "the console refuses a wrong password and opens the menu with the right one")
+        vm.keys("s", "s", "s", ENTER)           # storage, setup, shell
+        vm.expect(r"Type 'exit' to go back to the menu", 30)
+        time.sleep(2)
+        vm.send("export PS1='__ELPIS_''PROMPT__# '; stty sane -echo cols 250\n")
+        vm.expect(re.escape(PROMPT), 30)
+
+        # An update, installed through the menu.
+        vm.send("stty sane echo rows 24 cols 80; TERM=vt100 elpis-config; echo __MENU__$?__\n")
+        vm.expect_screen("Run the setup guide again", 30); vm.keys("u", ENTER)
+        vm.expect_screen("Install an update from a URL"); vm.keys(ENTER)
+        vm.expect_screen("URL of the ISO"); vm.keys(CLEAR, f"{url}/{upd}", ENTER)
+        vm.expect_screen("finished with status 0", 300); vm.keys(ENTER)
+        vm.expect_screen("Restart now to start the update"); vm.keys(ENTER)
+        vm.grub(0)
+        vm.login(password="rootpass123")
+        now = release_id(vm)
+        check(now != base and "update" in now, f"the update installed from the menu starts: {now}")
+        ok = False
+        for _ in range(40):
+            if vm.out("sed -n 's/^good=//p' /data/grubenv") == now:
+                ok = True
+                break
+            time.sleep(3)
+        check(ok, "and is kept once the resolver answers")
+        check(vm.out("hostname") == "resolver-1", "the settings came along")
+
+        # Factory reset through the menu.
+        vm.send("stty sane echo rows 24 cols 80; TERM=vt100 elpis-config; echo __MENU__$?__\n")
+        vm.expect_screen("Run the setup guide again", 30); vm.keys("s", ENTER)
+        vm.expect_screen("Factory reset: erase settings"); vm.keys("f", ENTER)
+        vm.expect_screen("Erase every setting"); vm.keys(ENTER)
+        vm.expect_screen("cannot be undone"); vm.keys(ENTER)
+        vm.grub(0)
+        vm.login()
+        check(True, "after the factory reset root has no password again")
+        check(release_id(vm) == base, "the version on the medium starts")
+        check(vm.run("elpis-config needs-setup")[0] == 0, "and the setup guide is due again")
+        check(vm.out("hostname") == "elpis", "with the default name")
+    finally:
+        vm.stop()
+        httpd.shutdown()
+
+
+
+def t_config_ram(a):
+    blank = fresh_disk(os.path.join(WORK, "config-blank.raw"), size="1G")
+    vm = VM("ram", cdrom=a.iso, disks=[blank], boot="d")
+    ESC = "\x1b"
+    try:
+        vm.grub(0)
+        vm.login()
+        check(state(vm).get("MODE") == "ram", "started from a CD: RAM only")
+        vm.send("stty sane echo rows 24 cols 80; TERM=vt100 elpis-config --wizard; echo __WIZ__$?__\n")
+        vm.expect_screen("This guide sets"); vm.keys(ENTER)
+        vm.expect_screen("An empty disk can keep them"); vm.keys(ENTER)
+        vm.expect_screen("Type vda to go ahead"); vm.keys("vda", ENTER)
+        vm.expect_screen("finished with status 0", 120); vm.keys(ENTER)
+        # Leave the rest of the guide with Esc, step by step.
+        for words in ("resolver's name", "easiest to point", "Queries from anywhere",
+                      "read-only status page", "NTP servers, by address", "Protect the menu"):
+            vm.expect_screen(words, 60)
+            vm.keys(ESC, gap=1.5)
+        vm.expect_screen("Setup is done", 60); vm.keys(ENTER)
+        m = vm.expect(r"__WIZ__(\d+)__", 30)
+        check(m.group(1) == b"0", "the guide offers the empty disk first, and every later step can be left with Esc")
+        back_to_shell(vm)
+        s = state(vm)
+        check(s.get("MODE") == "persistent" and s.get("DATA_DEV") == "/dev/vda1", "settings are kept on the disk from then on")
+        check(vm.run("test -e /data/config/.setup-done")[0] == 0, "including that the guide is done")
+        vm.reboot()
+        vm.grub(0)
+        vm.login()
+        check(state(vm).get("MODE") == "persistent" and vm.run("elpis-config needs-setup")[0] != 0,
+              "after a restart from the CD the guide does not come back")
+    finally:
+        vm.stop()
+
 SCENARIOS = {
     "cd": t_cd, "disk": t_disk, "uefi": t_uefi, "cd-data": t_cd_data,
-    "foreign": t_foreign, "copy": t_copy, "update": t_update,
+    "foreign": t_foreign, "copy": t_copy, "update": t_update, "config": t_config,
+    "config-ram": t_config_ram,
 }
 CURRENT = "setup"
 

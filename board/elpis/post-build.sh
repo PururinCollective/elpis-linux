@@ -21,6 +21,7 @@ echo "$STAMP" > "$BASE_DIR/elpis-build-stamp"
 ISO_UUID=$(echo "$STAMP" | sed 's/^\(....\)\(..\)\(..\)\(..\)\(..\)\(..\)\(..\)$/\1-\2-\3-\4-\5-\6-\7/')
 
 # The resolver package leaves its version here.
+# shellcheck disable=SC1091
 . "$TARGET/usr/share/elpis/resolver-version"
 
 # ---- release identity --------------------------------------------------------
@@ -97,4 +98,4 @@ fi
 
 # ---- nothing boots from the root filesystem itself --------------------------------
 # The kernel and GRUB go on the ISO; copies installed here would only take RAM.
-rm -rf "$TARGET/boot"
+rm -rf "${TARGET:?}/boot"

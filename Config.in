@@ -1,1 +1,2 @@
 source "$BR2_EXTERNAL_ELPIS_PATH/package/elpis-resolver/Config.in"
+source "$BR2_EXTERNAL_ELPIS_PATH/package/elpis-config/Config.in"

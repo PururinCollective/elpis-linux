@@ -91,7 +91,66 @@ system onto another disk and carries the settings over.
 | **Safe mode** | start without putting saved settings back (they stay on `ELPIS-DATA`) |
 | **Factory reset … → Erase all settings and updates** | reformat `ELPIS-DATA`, then start the ISO's own version |
 
-## Settings
+## Setting it up: elpis-config
+
+The screen runs `elpis-config`. On the first start it runs a setup guide:
+
+1. **Storage.** When settings are in RAM only and there is an empty disk, it
+   offers to keep them there.
+2. **Name.**
+3. **Network.** IPv4 by DHCP or a fixed address; IPv6 automatic (router
+   advertisements) or fixed. A network change is undone after 60 seconds
+   unless you keep it, so a typo cannot lock you out of a remote machine.
+4. **Who may use the resolver.** Private networks, or a list of your own.
+5. **Status page** and its password.
+6. **NTP servers.**
+7. **A root password.** Once set, it guards the menu on the screen, and SSH.
+
+Each step is kept as soon as it is done, and Esc skips one. After that the
+screen shows the resolver's status and a menu:
+
+- Network
+- Resolver: who may use it, listen addresses, DNSSEC, DoT to authoritative
+  servers, ECS, the identity probe
+- Status page
+- Time
+- Remote access: SSH, keys, root password
+- Licence
+- Diagnostics: look up, log, ping, the identity probe
+- Updates
+- Storage: an empty disk for settings, copy to disk, reset settings, factory
+  reset
+- Restart, shut down, shell
+
+Over SSH or the serial console, run `elpis-config`.
+
+Every setting is also a plain command, which checks its input, applies it and
+keeps it:
+
+```bash
+elpis-config set access-control '192.168.1.0/24 allow' '127.0.0.0/8 allow'
+elpis-config network --ipv4 192.168.1.53/24 --gw4 192.168.1.1 --trial 60
+elpis-config network --keep
+echo 'a long password' | elpis-config webgui-password
+elpis-config --help
+```
+
+`elpis-config set` changes only its own keys in `elpis.conf`: `listen`,
+`access-control`, `dnssec`, `authoritative-dot`, `ecs`, `identity`, `webgui`,
+`webgui-password` and `licence`. It edits them in place, leaving every other
+line and comment as it was. Each change has to pass the resolver's own check
+before it is used. That check counts `elpis -t`'s ERROR lines as well as its
+exit status, because `elpis -t` exits 0 even when it kept defaults for
+settings it could not read.
+
+### SSH
+
+SSH (dropbear) is off until it is turned on in the menu or with
+`elpis-config ssh on`. Logins need a key (`elpis-config ssh-key add ...`) or
+a root password; empty passwords are refused. The host keys are kept on
+`ELPIS-DATA`, so they stay the same from one start to the next.
+
+## Settings by hand
 
 Everything runs from RAM. A change lasts until the next reboot unless it is
 saved:
@@ -166,20 +225,38 @@ TLS certificates, so the signature is what makes an update trustworthy.
 ## Testing
 
 ```bash
-tests/elpis-test.py                       # all scenarios against the newest ISO
-tests/elpis-test.py cd disk               # some of them
-tests/elpis-test.py --iso A.iso --update-iso B.iso --key keys/test.key update
+tests/elpis-config-test.sh                # elpis-config's commands, on the host
+tests/build-test-isos.sh                  # two ISOs signed with a throwaway key
+tests/elpis-test.py --iso tests/work/base.iso --update-iso tests/work/update.iso \
+    --key tests/work/keys/test.key        # every scenario in QEMU
+tests/elpis-test.py cd disk               # some of them, against the newest ISO
 ```
 
-These boot the ISO in QEMU with KVM: as a CD, written to a disk under BIOS and
-UEFI (OVMF), a CD plus a blank disk, a disk with foreign partitions, a copy
-made with `elpis-copy-to-disk`, and a signed update followed by a broken one
-that GRUB has to fall back from. Every serial console is logged in
-`tests/work/`.
+`elpis-config-test.sh` runs `elpis-config`'s commands against a copy of the
+image's files, with BusyBox and the image's own `elpis` binary. It checks that
+every resolver setting can be set, passes `elpis -t`, and changes nothing else,
+and that bad values are refused.
 
-## For the elpis-config TUI
+`elpis-test.py` boots the ISO in QEMU with KVM:
 
-What the boot scripts provide, for a front end to build on:
+- as a CD;
+- written to a disk, under BIOS and UEFI (OVMF);
+- as a CD plus a blank disk;
+- with a disk that has foreign partitions;
+- a copy made with `elpis-copy-to-disk`;
+- a signed update, then a broken one that GRUB has to fall back from.
+
+It also drives `elpis-config`'s dialogs over the serial console. It runs the
+setup guide, restarts, logs in over SSH, and goes through the console
+password. It installs an update and does a factory reset from the menu.
+Every serial console is logged in `tests/work/`.
+
+After editing `package/elpis-config/src/`, run `make elpis-config-rebuild`
+before `make`: Buildroot copies a local package's source only once.
+
+## For scripts
+
+What the boot scripts provide, and what `elpis-config` builds on:
 
 | | |
 |---|---|
@@ -192,9 +269,16 @@ What the boot scripts provide, for a front end to build on:
 | `/etc/init.d/S50elpis restart` | restart the resolver |
 | `/run/elpis/health` | `up` once the resolver answered after boot, `down` if it did not |
 
-Files a TUI would own, all in the keep list: `/etc/elpis/elpis.conf`,
-`/etc/network/interfaces`, `/etc/hostname`, `/etc/elpis/ntp.conf`, `/etc/shadow`
-(root password), `/etc/dropbear`.
+The files `elpis-config` writes are all in the keep list:
+
+- `/etc/elpis/elpis.conf`
+- `/etc/network/interfaces`
+- `/etc/hostname`
+- `/etc/elpis/ntp.conf`
+- `/etc/elpis/ssh.conf`
+- `/etc/shadow` (the root password)
+- `/etc/dropbear`
+- `/root/.ssh`
 
 ## Layout
 
@@ -202,19 +286,23 @@ Files a TUI would own, all in the keep list: `/etc/elpis/elpis.conf`,
 |---|---|
 | `configs/elpis_x86_64_defconfig` | the Buildroot configuration |
 | `package/elpis-resolver/` | builds the resolver from its release tag |
+| `package/elpis-config/` | the setup guide and menu, its address checker, and the SSH start script |
 | `board/elpis/linux.fragment`, `busybox.fragment` | kernel and BusyBox changes on top of their defaults |
 | `board/elpis/post-build.sh` | release identity, the appliance's `elpis.conf` |
 | `board/elpis/post-image.sh` | GRUB core images and the hybrid ISO |
 | `board/elpis/grub/` | the boot menu, with the update and fallback logic |
 | `board/elpis/rootfs-overlay/` | `elpis-storage`, `elpis-save`, `elpis-update`, `elpis-copy-to-disk`, init scripts |
 | `tests/elpis-test.py` | the QEMU tests |
+| `tests/elpis-config-test.sh` | `elpis-config` on the host |
+| `tests/build-test-isos.sh` | the signed ISOs the update tests use |
 
 ## Not yet
 
-- No SSH: the console (screen or serial) is the only way in. The root account
-  has no password until you set one with `passwd` and keep it with `elpis-save`.
-- No guided setup yet: network and resolver settings are edited by hand.
-  An `elpis-config` TUI is planned.
+- One network port is configured; IPv6 is automatic (SLAAC) or fixed, with
+  no DHCPv6.
+- The kernel (about 11 MB) is the x86_64 defconfig with some trimming and
+  can get much smaller.
+- Tested in QEMU only, not yet on a physical machine or USB stick.
 - x86-64 only.
 
 ## Licence

@@ -1,0 +1,12 @@
+config BR2_PACKAGE_ELPIS_CONFIG
+	bool "elpis-config"
+	depends on BR2_PACKAGE_ELPIS_RESOLVER
+	select BR2_PACKAGE_DIALOG
+	help
+	  Setup guide and menu for the Elpis appliance: network,
+	  resolver settings, status page, time, SSH, updates and
+	  storage, on the screen (tty1) or over SSH.  Every setting
+	  also has a plain command (elpis-config --help).
+
+comment "elpis-config needs elpis-resolver"
+	depends on !BR2_PACKAGE_ELPIS_RESOLVER

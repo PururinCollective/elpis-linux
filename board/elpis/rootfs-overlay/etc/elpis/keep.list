@@ -8,3 +8,5 @@
 /etc/hostname
 /etc/shadow
 /etc/dropbear
+/etc/elpis/ssh.conf
+/root/.ssh
